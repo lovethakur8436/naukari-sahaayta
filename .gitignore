@@ -1,0 +1,32 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables (API Keys)
+.env
+
+# Data and Artifacts (Database, generated resumes, logs, screenshots)
+data/
+*.sqlite
+*.db
+*.log
+*.pdf
+*.tex
+*.json
+
+# VS Code settings (optional but recommended)
+.vscode/
+
+# Streamlit
+.streamlit/
+
+# OS generated files
+.DS_Store
+Thumbs.db
