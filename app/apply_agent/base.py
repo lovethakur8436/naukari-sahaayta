@@ -13,7 +13,8 @@ class BaseApplyAgent(ABC):
         result = {"status": "FAILED", "logs": [], "screenshot": None}
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=self.headless)
+                # Add slow_mo to slow down the automation so the user can visually track it
+                browser = p.chromium.launch(headless=self.headless, slow_mo=500)
                 context = browser.new_context()
                 page = context.new_page()
                 

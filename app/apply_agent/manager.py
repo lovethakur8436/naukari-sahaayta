@@ -6,7 +6,8 @@ from app.apply_agent.greenhouse import GreenhouseApplyAgent
 
 def process_application(db: Session, application: Application, candidate_profile: dict):
     if application.job.portal.lower() == "greenhouse":
-        agent = GreenhouseApplyAgent(headless=False) # Headless=False for debugging/monitoring
+        # Launch headed (non-headless) mode so the user can watch the browser automation live
+        agent = GreenhouseApplyAgent(headless=False)
     else:
         print(f"No agent configured for {application.job.portal}")
         return

@@ -13,14 +13,32 @@ tab1, tab2, tab3 = st.tabs(["Jobs", "Applications", "Candidate Profile & Setup"]
 with tab3:
     st.header("Candidate Profile Setup")
     
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
+        st.subheader("Basic Info")
         first_name = st.text_input("First Name", "Luv")
         last_name = st.text_input("Last Name", "Kumar")
         email = st.text_input("Email", "luvkumar8436@gmail.com")
-        phone = st.text_input("Phone", "+917689961477")
+        phone = st.text_input("Phone", "+91-7689961477")
         
     with col2:
+        st.subheader("Links")
+        linkedin_url = st.text_input("LinkedIn", "linkedin.com/in/luv-kumar-06975b175")
+        github_url = st.text_input("GitHub", "https://github.com/lovethakur8436")
+        portfolio_url = st.text_input("Portfolio / Website", "")
+        
+    with col3:
+        st.subheader("Demographics & Status")
+        location_input = st.text_input("Current Location", "Hyderabad, India")
+        work_auth = st.selectbox("Work Authorization (US)", ["Authorized", "Require Sponsorship", "N/A"], index=2)
+        gender = st.selectbox("Gender", ["Male", "Female", "Non-binary", "Decline to self-identify"], index=0)
+        hispanic = st.selectbox("Hispanic/Latino", ["Yes", "No", "Decline to self-identify"], index=1)
+        veteran = st.selectbox("Veteran Status", ["I am not a protected veteran", "Decline to self-identify"], index=0)
+        disability = st.selectbox("Disability Status", ["No, I don't have a disability", "Decline to self-identify"], index=0)
+        
+    st.subheader("Base Resume Configurations")
+    colA, colB = st.columns(2)
+    with colA:
         base_resume_text = st.text_area("Base Resume (Text format for matching)", height=200, value="""Professional Summary
 Java Software Engineer with 3.5+ years at Wells Fargo designing and maintaining Spring Boot microservices for high-volume financial transaction processing. Experienced in REST API development, Hibernate/Spring Data JPA, OAuth2/JWT security, and cloud-native deployments on AWS. Hands-on with CI/CD pipelines, Ansible-based infrastructure automation, and full-stack delivery using React.js. Proven ability to ship AI-powered products end-to-end in Agile, regulated banking environments.
 
@@ -150,6 +168,10 @@ with tab1:
 
 with tab2:
     st.header("Application Queue")
+    
+    if st.button("Refresh Applications"):
+        st.rerun()
+        
     try:
         apps = requests.get(f"{API_URL}/applications").json()
         jobs_req = requests.get(f"{API_URL}/jobs").json()
@@ -162,9 +184,14 @@ with tab2:
                 company = job_info.get("company", "Unknown Company")
                 location = job_info.get("location", "Unknown Location")
                 
-                with st.expander(f"Application #{app['id']} | {company} - {title} | Score: {app['fit_score']}"):
+                with st.expander(f"App #{app['id']} | {company} - {title} | {location} | Fit: {app['fit_score']}"):
                     st.write(f"**Role Details:** {title} @ {company} ({location})")
-                    st.write(f"**Status:** {app['status']}")
+                    
+                    # Highlight status
+                    status_color = "blue"
+                    if app['status'] == 'AUTO_APPLIED': status_color = "green"
+                    elif app['status'] == 'FAILED': status_color = "red"
+                    st.markdown(f"**Status:** :{status_color}[{app['status']}]")
                     
                     full_analysis = app.get('fit_analysis', '')
                     short_analysis = full_analysis.split('\n')[0] if full_analysis else ""
@@ -184,10 +211,30 @@ with tab2:
                                 "first_name": first_name,
                                 "last_name": last_name,
                                 "email": email,
-                                "phone": phone
+                                "phone": phone,
+                                "linkedin": linkedin_url,
+                                "github": github_url,
+                                "portfolio": portfolio_url,
+                                "location": location_input,
+                                "work_auth": work_auth,
+                                "gender": gender,
+                                "hispanic": hispanic,
+                                "veteran": veteran,
+                                "disability": disability
                             }
                             res = requests.post(f"{API_URL}/applications/{app['id']}/apply", json=profile)
-                            st.success("Apply process started!")
+                            st.success("Apply process started! Wait a few seconds and click 'Refresh Applications' above.")
+                            
+                    # Show logs if they exist
+                    if app.get('submission_log_json_path'):
+                        try:
+                            with open(app['submission_log_json_path'], 'r') as f:
+                                log_data = json.load(f)
+                            st.write("**Apply Logs:**")
+                            for log in log_data.get('logs', []):
+                                st.code(log, language='text')
+                        except Exception:
+                            pass
         else:
             st.info("No applications generated yet.")
     except Exception as e:
