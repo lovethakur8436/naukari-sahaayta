@@ -5,34 +5,27 @@ import json
 import os
 from groq import Groq
 
+# Keywords that identify "location trigger" selects — filling these causes Greenhouse
+# to re-render the whole form, wiping any selects already filled after them.
+LOCATION_TRIGGER_IDS = {"country", "question_35900714002", "location", "country_id"}
+LOCATION_TRIGGER_LABELS = {"country", "location", "country of residence", "current country"}
 
-def _click_select_option(page, selector: str, value: str, result_logs: list) -> bool:
-    """
-    Fill a <select> by simulating real user interaction:
-      1. Focus the element
-      2. Use Playwright's select_option (handles both native and React-controlled selects)
-      3. Immediately re-read the value from DOM to confirm it actually stuck
-      4. If it didn't stick, retry once via the native property-descriptor setter trick
 
-    Returns True if the value was confirmed set, False otherwise.
-    """
+def _fill_select(page, selector: str, value: str, logs: list) -> bool:
+    """Fill a <select> and confirm the value actually stuck in the DOM."""
     loc = page.locator(selector)
-
-    # --- Attempt 1: Playwright select_option (works for most cases) ---
     try:
         loc.focus(timeout=3000)
         loc.select_option(value=value, timeout=5000)
-        page.wait_for_timeout(300)  # Let React process the synthetic event
-
+        page.wait_for_timeout(400)
         actual = loc.evaluate("el => el.value")
         if actual == value:
             return True
-        result_logs.append(f"select_option set '{value}' but DOM reads '{actual}', trying native setter...")
+        logs.append(f"select_option set '{value}' but DOM reads '{actual}', trying native setter...")
     except Exception as e:
-        result_logs.append(f"select_option failed ({e}), trying native setter...")
+        logs.append(f"select_option failed ({e}), trying native setter...")
 
-    # --- Attempt 2: Native HTMLSelectElement property-descriptor setter ---
-    # React bypasses the DOM setter, so we go through the prototype chain directly.
+    # Fallback: native HTMLSelectElement property-descriptor setter (bypasses React state)
     try:
         loc.evaluate("""
             (el, val) => {
@@ -40,21 +33,37 @@ def _click_select_option(page, selector: str, value: str, result_logs: list) -> 
                     window.HTMLSelectElement.prototype, 'value'
                 ).set;
                 nativeSetter.call(el, val);
-                ['input', 'change', 'blur'].forEach(evtName =>
-                    el.dispatchEvent(new Event(evtName, { bubbles: true }))
+                ['input', 'change', 'blur'].forEach(n =>
+                    el.dispatchEvent(new Event(n, { bubbles: true }))
                 );
             }
         """, value)
-        page.wait_for_timeout(300)
-
+        page.wait_for_timeout(400)
         actual = loc.evaluate("el => el.value")
         if actual == value:
             return True
-        result_logs.append(f"Native setter set '{value}' but DOM still reads '{actual}'. Giving up.")
+        logs.append(f"Native setter: DOM still reads '{actual}' after setting '{value}'.")
     except Exception as e:
-        result_logs.append(f"Native setter also failed: {e}")
+        logs.append(f"Native setter failed: {e}")
 
     return False
+
+
+def _resolve_matched_value(answer_val: str, available_options: list) -> tuple:
+    """Return (matched_value, match_type) from available_options for answer_val."""
+    # 1. Exact value match
+    for o in available_options:
+        if str(o['value']) == str(answer_val):
+            return o['value'], 'exact'
+    # 2. Case-insensitive label match
+    for o in available_options:
+        if o['text'].strip().lower() == str(answer_val).strip().lower():
+            return o['value'], 'label'
+    # 3. Partial text match
+    for o in available_options:
+        if str(answer_val).strip().lower() in o['text'].strip().lower():
+            return o['value'], 'partial'
+    return None, None
 
 
 class GreenhouseApplyAgent(BaseApplyAgent):
@@ -92,7 +101,7 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                     fc_info.value.set_files(application.tailored_resume_pdf_path)
 
         # ------------------------------------------------------------------ #
-        #  Answer Custom Questions using Groq                                 #
+        #  Scrape + answer custom questions                                   #
         # ------------------------------------------------------------------ #
         try:
             questions_data = page.evaluate("""() => {
@@ -104,70 +113,50 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                     + 'input[type="checkbox"]:not([hidden]):not([style*="display: none"]),'
                     + 'input[type="radio"]:not([hidden]):not([style*="display: none"])'
                 );
-
                 elements.forEach(el => {
                     if (['first_name', 'last_name', 'email', 'phone'].includes(el.id)) return;
                     if (el.className.includes('recaptcha') || el.id.includes('recaptcha')) return;
                     if (el.offsetWidth === 0 || el.offsetHeight === 0) return;
-
                     const container = el.closest('div.field, div.custom_question');
-                    const labelEl   = container?.querySelector('label')
-                                   || document.querySelector(`label[for="${el.id}"]`);
-
-                    let mainQuestionLabel = '';
-                    if (['radio', 'checkbox', 'select'].includes(el.type) && container) {
-                        const topLabel = container.querySelector('label');
-                        if (topLabel) mainQuestionLabel = topLabel.innerText.trim();
+                    const labelEl = container?.querySelector('label')
+                                 || document.querySelector(`label[for="${el.id}"]`);
+                    let mainQ = '';
+                    if (['radio','checkbox','select'].includes(el.type) && container) {
+                        const t = container.querySelector('label');
+                        if (t) mainQ = t.innerText.trim();
                     }
-                    if (el.tagName === 'SELECT' && !mainQuestionLabel) {
-                        const parentDiv = el.closest('div.field, div.custom_question');
-                        if (parentDiv) {
-                            for (let lbl of parentDiv.querySelectorAll('label')) {
-                                if (lbl.innerText.trim() && lbl.innerText.trim() !== '*') {
-                                    mainQuestionLabel = lbl.innerText.trim();
-                                    break;
-                                }
-                            }
+                    if (el.tagName === 'SELECT' && !mainQ) {
+                        const p = el.closest('div.field, div.custom_question');
+                        if (p) for (let l of p.querySelectorAll('label')) {
+                            if (l.innerText.trim() && l.innerText.trim() !== '*') { mainQ = l.innerText.trim(); break; }
                         }
                     }
-
                     let label = labelEl ? labelEl.innerText.trim() : (el.name || el.id);
-                    if (mainQuestionLabel && mainQuestionLabel !== label)
-                        label = `${mainQuestionLabel} - ${label}`;
-
+                    if (mainQ && mainQ !== label) label = `${mainQ} - ${label}`;
                     const isRequired = el.required
                         || !!container?.querySelector('label.required, [aria-required="true"], abbr[title="required"]')
                         || label.includes('*');
-
-                    let fi = { id: el.id, name: el.name, label,
-                               type: el.type || el.tagName.toLowerCase(), required: isRequired };
-
+                    let fi = { id: el.id, name: el.name, label, type: el.type || el.tagName.toLowerCase(), required: isRequired };
                     if (el.tagName === 'SELECT') {
                         fi.type = 'select';
-                        fi.options = Array.from(el.options)
-                            .map(o => ({ value: o.value, text: o.text }))
-                            .filter(o => o.value);
+                        fi.options = Array.from(el.options).map(o => ({ value: o.value, text: o.text })).filter(o => o.value);
                     }
-
                     if (fi.type === 'radio' || fi.type === 'checkbox') {
-                        const existing = fields.find(f => f.name === fi.name);
-                        if (existing) {
-                            existing.options = existing.options || [];
-                            existing.options.push({ value: el.value, id: el.id, label });
-                            return;
-                        }
+                        const ex = fields.find(f => f.name === fi.name);
+                        if (ex) { ex.options = ex.options || []; ex.options.push({ value: el.value, id: el.id, label }); return; }
                         fi.options = [{ value: el.value, id: el.id, label }];
                     }
-
                     fields.push(fi);
                 });
                 return fields;
             }""")
 
-            if questions_data:
-                result["logs"].append(f"Found {len(questions_data)} custom questions. Asking Groq for answers...")
+            if not questions_data:
+                questions_data = []
 
-                prompt = f"""
+            result["logs"].append(f"Found {len(questions_data)} custom questions. Asking Groq for answers...")
+
+            prompt = f"""
 You are helping a candidate fill out a job application form.
 Based on the candidate's profile, answer the following custom form fields.
 
@@ -198,116 +187,137 @@ Form Fields:
 Return a JSON object: keys = field `id` (or `name` if id empty), values = exact `value` to use.
 """
 
-                client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-                chat_completion = client.chat.completions.create(
-                    messages=[{"role": "user", "content": prompt}],
-                    model="llama-3.3-70b-versatile",
-                    response_format={"type": "json_object"},
+            client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+            chat_completion = client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model="llama-3.3-70b-versatile",
+                response_format={"type": "json_object"},
+            )
+            answers = json.loads(chat_completion.choices[0].message.content)
+
+            # ------------------------------------------------------------------ #
+            # KEY FIX: Split answers into two passes                              #
+            #   Pass 1 — location/country triggers (these cause form re-renders)  #
+            #   Pass 2 — everything else                                           #
+            #                                                                     #
+            # Filling a country dropdown causes Greenhouse to re-render the whole  #
+            # form (sponsorship/visa questions change based on country). Any select #
+            # filled BEFORE country gets wiped by that re-render. So we fill       #
+            # country first, wait for the re-render to settle, then fill the rest. #
+            # ------------------------------------------------------------------ #
+
+            def _is_location_trigger(fid: str, finfo: dict) -> bool:
+                if fid in LOCATION_TRIGGER_IDS:
+                    return True
+                label_lower = (finfo.get("label") or "").lower()
+                return any(kw in label_lower for kw in LOCATION_TRIGGER_LABELS)
+
+            # Build ordered list: location triggers first, rest second
+            trigger_items = []
+            other_items = []
+            for field_id, answer_val in answers.items():
+                if not field_id:
+                    continue
+                field_info = next(
+                    (f for f in questions_data if f['id'] == field_id or f['name'] == field_id),
+                    None
                 )
-                answers = json.loads(chat_completion.choices[0].message.content)
+                if not field_info:
+                    for q in questions_data:
+                        for opt in q.get('options', []):
+                            if opt.get('id') == field_id:
+                                field_info = q
+                                break
+                        if field_info:
+                            break
+                if not field_info:
+                    continue
+                if _is_location_trigger(field_id, field_info):
+                    trigger_items.append((field_id, answer_val, field_info))
+                else:
+                    other_items.append((field_id, answer_val, field_info))
 
-                for field_id, answer_val in answers.items():
-                    if not field_id:
-                        continue
-                    try:
-                        field_info = next(
-                            (f for f in questions_data if f['id'] == field_id or f['name'] == field_id),
-                            None
-                        )
-                        if not field_info:
-                            for q in questions_data:
-                                for opt in q.get('options', []):
-                                    if opt.get('id') == field_id:
-                                        field_info = q
-                                        break
-                                if field_info:
-                                    break
-                        if not field_info:
-                            continue
+            ordered_items = trigger_items + other_items
 
-                        field_type = field_info['type']
-                        selector = (
-                            f"[id='{field_info['id']}']" if field_info['id'] and "'" not in field_info['id']
-                            else f"[name='{field_info['name']}']"
-                        )
+            # Store filled select values so we can re-fill in the final pass
+            filled_selects = {}  # selector -> matched_value
 
-                        if field_type == 'select':
-                            available_options = field_info.get('options', [])
-
-                            # Resolve answer value → actual <option value=...>
-                            matched_value = next(
-                                (o['value'] for o in available_options if str(o['value']) == str(answer_val)),
-                                None
-                            )
-                            if matched_value is None:
-                                matched_value = next(
-                                    (o['value'] for o in available_options
-                                     if o['text'].strip().lower() == str(answer_val).strip().lower()),
-                                    None
-                                )
-                                if matched_value is not None:
-                                    result["logs"].append(f"Label-matched '{answer_val}' -> '{matched_value}' for {field_id}")
-                            if matched_value is None:
-                                matched_value = next(
-                                    (o['value'] for o in available_options
-                                     if str(answer_val).strip().lower() in o['text'].strip().lower()),
-                                    None
-                                )
-                                if matched_value is not None:
-                                    result["logs"].append(f"Partial-matched '{answer_val}' -> '{matched_value}' for {field_id}")
-
-                            if matched_value is not None:
-                                ok = _click_select_option(page, selector, str(matched_value), result["logs"])
-                                if not ok:
-                                    result["logs"].append(
-                                        f"WARNING: Could not reliably set {field_id}='{matched_value}'. "
-                                        f"Available: {available_options}"
-                                    )
+            def fill_one(field_id, answer_val, field_info):
+                field_type = field_info['type']
+                selector = (
+                    f"[id='{field_info['id']}']" if field_info['id'] and "'" not in field_info['id']
+                    else f"[name='{field_info['name']}']"
+                )
+                try:
+                    if field_type == 'select':
+                        available_options = field_info.get('options', [])
+                        matched_value, match_type = _resolve_matched_value(str(answer_val), available_options)
+                        if matched_value is not None:
+                            if match_type != 'exact':
+                                result["logs"].append(f"{match_type}-matched '{answer_val}' -> '{matched_value}' for {field_id}")
+                            ok = _fill_select(page, selector, str(matched_value), result["logs"])
+                            if ok:
+                                filled_selects[selector] = str(matched_value)
                             else:
-                                result["logs"].append(
-                                    f"WARNING: No option match for {field_id} answer='{answer_val}'. "
-                                    f"Available: {available_options}"
-                                )
-
-                        elif field_type == 'checkbox':
-                            page.locator(f"[id='{answer_val}']").click(force=True, timeout=5000)
-
-                        elif field_type == 'radio':
-                            radio_el = page.locator(f"[id='{answer_val}']")
-                            radio_el.click(force=True, timeout=5000)
-                            radio_el.evaluate("el => el.dispatchEvent(new Event('change', { bubbles: true }))")
-
+                                result["logs"].append(f"WARNING: Could not set {field_id}='{matched_value}'. Options: {available_options}")
                         else:
-                            page.locator(selector).fill(str(answer_val), timeout=5000)
-                            page.locator(selector).evaluate(
-                                "el => el.dispatchEvent(new Event('blur', { bubbles: true }))"
-                            )
+                            result["logs"].append(f"WARNING: No option match for {field_id} answer='{answer_val}'. Options: {available_options}")
 
-                        result["logs"].append(f"Filled {field_id} with: {answer_val}")
+                    elif field_type == 'checkbox':
+                        page.locator(f"[id='{answer_val}']").click(force=True, timeout=5000)
 
+                    elif field_type == 'radio':
+                        radio_el = page.locator(f"[id='{answer_val}']")
+                        radio_el.click(force=True, timeout=5000)
+                        radio_el.evaluate("el => el.dispatchEvent(new Event('change', { bubbles: true }))")
+
+                    else:
+                        page.locator(selector).fill(str(answer_val), timeout=5000)
+                        page.locator(selector).evaluate(
+                            "el => el.dispatchEvent(new Event('blur', { bubbles: true }))"
+                        )
+
+                    result["logs"].append(f"Filled {field_id} with: {answer_val}")
+                except Exception as e:
+                    result["logs"].append(f"Failed to fill {field_id}: {str(e)}")
+
+            # Pass 1: location triggers — fill and wait for re-render
+            for field_id, answer_val, field_info in trigger_items:
+                fill_one(field_id, answer_val, field_info)
+
+            if trigger_items:
+                result["logs"].append("Waiting for re-render after location/country fields...")
+                page.wait_for_load_state("networkidle")
+                page.wait_for_timeout(1000)
+
+            # Pass 2: everything else
+            for field_id, answer_val, field_info in other_items:
+                fill_one(field_id, answer_val, field_info)
+
+            # ------------------------------------------------------------------ #
+            # FINAL RE-FILL PASS: re-apply all selects after full settle wait     #
+            # Some React re-renders happen lazily after the last field is filled.  #
+            # Re-filling selects right before the screenshot guarantees they hold. #
+            # ------------------------------------------------------------------ #
+            page.wait_for_timeout(1500)
+            if filled_selects:
+                result["logs"].append(f"Re-fill pass: verifying {len(filled_selects)} select(s)...")
+                for selector, value in filled_selects.items():
+                    try:
+                        loc = page.locator(selector)
+                        actual = loc.evaluate("el => el.value")
+                        if actual != value:
+                            result["logs"].append(f"Re-fill: {selector} was '{actual}', re-setting to '{value}'")
+                            _fill_select(page, selector, value, result["logs"])
+                        else:
+                            result["logs"].append(f"Re-fill OK: {selector} = '{value}'")
                     except Exception as e:
-                        result["logs"].append(f"Failed to fill {field_id}: {str(e)}")
+                        result["logs"].append(f"Re-fill check failed for {selector}: {e}")
 
         except Exception as e:
             result["logs"].append(f"Error processing custom questions: {str(e)}")
 
-        # Give React time to settle after all fields are filled
-        page.wait_for_timeout(2000)
-
-        # ------------------------------------------------------------------ #
-        #  Re-verify all select fields AFTER the settle wait                  #
-        #  (React sometimes resets them on the next render cycle)             #
-        # ------------------------------------------------------------------ #
-        try:
-            page.evaluate("""() => {
-                // Log current values of all visible selects to the page title temporarily
-                const selects = document.querySelectorAll('select:not([hidden])');
-                selects.forEach(s => {
-                    console.log('SELECT', s.id || s.name, '=', s.value);
-                });
-            }""")
-        except:
-            pass
+        page.wait_for_timeout(1000)
 
         # Screenshot just before submit
         try:
@@ -329,7 +339,7 @@ Return a JSON object: keys = field `id` (or `name` if id empty), values = exact 
         except:
             pass
 
-        page.wait_for_timeout(1000)
+        page.wait_for_timeout(500)
 
         # Submit
         try:
@@ -338,7 +348,6 @@ Return a JSON object: keys = field `id` (or `name` if id empty), values = exact 
                 submit_btn.first.click()
                 result["logs"].append("Clicked actual submit button! Application sent.")
                 page.wait_for_timeout(4000)
-
                 if "application" in page.url or "jobs" in page.url:
                     try:
                         error_texts = page.locator(".error-message, .field_with_errors").all_inner_texts()
