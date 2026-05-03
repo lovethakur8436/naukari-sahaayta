@@ -5,65 +5,98 @@ import json
 import os
 from groq import Groq
 
-# Keywords that identify "location trigger" selects — filling these causes Greenhouse
-# to re-render the whole form, wiping any selects already filled after them.
-LOCATION_TRIGGER_IDS = {"country", "question_35900714002", "location", "country_id"}
-LOCATION_TRIGGER_LABELS = {"country", "location", "country of residence", "current country"}
 
+def _fill_react_select(page, field_id: str, answer_text: str, logs: list) -> bool:
+    """
+    Interact with a React Select combobox widget exactly like a human:
+      1. Click the toggle button (or control div) to open the dropdown
+      2. Wait for the listbox/menu to appear
+      3. Find the option whose visible text best matches answer_text
+      4. Click it
 
-def _fill_select(page, selector: str, value: str, logs: list) -> bool:
-    """Fill a <select> and confirm the value actually stuck in the DOM."""
-    loc = page.locator(selector)
+    Greenhouse uses react-select for ALL dropdowns — there are zero native
+    <select> elements on the page. select_option() and JS value-setters
+    do not work here; only real click interaction does.
+    """
+    toggle_btn  = page.locator(f"[id='{field_id}']").locator("xpath=ancestor::div[contains(@class,'select__container')]").locator("button[aria-label='Toggle flyout']")
+    control_div = page.locator(f"[id='{field_id}']").locator("xpath=ancestor::div[contains(@class,'select__control')]")
+
+    # Step 1 — open the menu
     try:
-        loc.focus(timeout=3000)
-        loc.select_option(value=value, timeout=5000)
+        if toggle_btn.count() > 0:
+            toggle_btn.click(timeout=4000)
+        else:
+            control_div.click(timeout=4000)
         page.wait_for_timeout(400)
-        actual = loc.evaluate("el => el.value")
-        if actual == value:
-            return True
-        logs.append(f"select_option set '{value}' but DOM reads '{actual}', trying native setter...")
     except Exception as e:
-        logs.append(f"select_option failed ({e}), trying native setter...")
+        logs.append(f"react-select open failed for {field_id}: {e}")
+        return False
 
-    # Fallback: native HTMLSelectElement property-descriptor setter (bypasses React state)
+    # Step 2 — wait for the listbox to appear
+    listbox = page.locator(f"[id='react-select-{field_id}-listbox'], div[role='listbox']").first
     try:
-        loc.evaluate("""
-            (el, val) => {
-                const nativeSetter = Object.getOwnPropertyDescriptor(
-                    window.HTMLSelectElement.prototype, 'value'
-                ).set;
-                nativeSetter.call(el, val);
-                ['input', 'change', 'blur'].forEach(n =>
-                    el.dispatchEvent(new Event(n, { bubbles: true }))
-                );
-            }
-        """, value)
-        page.wait_for_timeout(400)
-        actual = loc.evaluate("el => el.value")
-        if actual == value:
-            return True
-        logs.append(f"Native setter: DOM still reads '{actual}' after setting '{value}'.")
+        listbox.wait_for(state="visible", timeout=4000)
+    except Exception:
+        # fallback: any visible option
+        pass
+
+    # Step 3 — find best matching option
+    #   React Select renders options as divs with id react-select-{id}-option-{n}
+    options = page.locator(f"[id^='react-select-{field_id}-option']")
+    count = options.count()
+    if count == 0:
+        # fallback: grab all visible option divs in an open menu
+        options = page.locator("div[role='option']")
+        count = options.count()
+
+    if count == 0:
+        logs.append(f"react-select: no options visible for {field_id} after opening")
+        page.keyboard.press("Escape")
+        return False
+
+    logs.append(f"react-select: {count} options visible for {field_id}, looking for '{answer_text}'")
+
+    # Collect all option texts for matching
+    option_texts = []
+    for i in range(count):
+        try:
+            option_texts.append(options.nth(i).inner_text().strip())
+        except Exception:
+            option_texts.append("")
+
+    # Match priority: exact → case-insensitive → partial
+    matched_idx = None
+    for i, t in enumerate(option_texts):
+        if t == answer_text:
+            matched_idx = i
+            break
+    if matched_idx is None:
+        for i, t in enumerate(option_texts):
+            if t.lower() == answer_text.lower():
+                matched_idx = i
+                logs.append(f"react-select: case-matched '{answer_text}' -> '{t}'")
+                break
+    if matched_idx is None:
+        for i, t in enumerate(option_texts):
+            if answer_text.lower() in t.lower():
+                matched_idx = i
+                logs.append(f"react-select: partial-matched '{answer_text}' -> '{t}'")
+                break
+
+    if matched_idx is None:
+        logs.append(f"react-select: no match for '{answer_text}' in {option_texts}. Closing.")
+        page.keyboard.press("Escape")
+        return False
+
+    # Step 4 — click the matched option
+    try:
+        options.nth(matched_idx).click(timeout=3000)
+        page.wait_for_timeout(300)
+        logs.append(f"react-select: clicked option '{option_texts[matched_idx]}' for {field_id}")
+        return True
     except Exception as e:
-        logs.append(f"Native setter failed: {e}")
-
-    return False
-
-
-def _resolve_matched_value(answer_val: str, available_options: list) -> tuple:
-    """Return (matched_value, match_type) from available_options for answer_val."""
-    # 1. Exact value match
-    for o in available_options:
-        if str(o['value']) == str(answer_val):
-            return o['value'], 'exact'
-    # 2. Case-insensitive label match
-    for o in available_options:
-        if o['text'].strip().lower() == str(answer_val).strip().lower():
-            return o['value'], 'label'
-    # 3. Partial text match
-    for o in available_options:
-        if str(answer_val).strip().lower() in o['text'].strip().lower():
-            return o['value'], 'partial'
-    return None, None
+        logs.append(f"react-select: click failed for {field_id}: {e}")
+        return False
 
 
 class GreenhouseApplyAgent(BaseApplyAgent):
@@ -101,51 +134,64 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                     fc_info.value.set_files(application.tailored_resume_pdf_path)
 
         # ------------------------------------------------------------------ #
-        #  Scrape + answer custom questions                                   #
+        #  Scrape custom questions                                            #
         # ------------------------------------------------------------------ #
         try:
             questions_data = page.evaluate("""() => {
                 const fields = [];
                 const elements = document.querySelectorAll(
-                    'select:not([hidden]):not([style*="display: none"]),'
-                    + 'input[type="text"]:not([hidden]):not([style*="display: none"]),'
+                    'input[role="combobox"],'
+                    + 'input[type="text"]:not([role="combobox"]):not([hidden]):not([style*="display: none"]),'
                     + 'textarea:not([hidden]):not([style*="display: none"]),'
                     + 'input[type="checkbox"]:not([hidden]):not([style*="display: none"]),'
                     + 'input[type="radio"]:not([hidden]):not([style*="display: none"])'
                 );
                 elements.forEach(el => {
-                    if (['first_name', 'last_name', 'email', 'phone'].includes(el.id)) return;
-                    if (el.className.includes('recaptcha') || el.id.includes('recaptcha')) return;
+                    if (['first_name','last_name','email','phone'].includes(el.id)) return;
+                    if (el.className && el.className.includes('recaptcha')) return;
+                    if (el.id && el.id.includes('recaptcha')) return;
                     if (el.offsetWidth === 0 || el.offsetHeight === 0) return;
-                    const container = el.closest('div.field, div.custom_question');
-                    const labelEl = container?.querySelector('label')
-                                 || document.querySelector(`label[for="${el.id}"]`);
-                    let mainQ = '';
-                    if (['radio','checkbox','select'].includes(el.type) && container) {
-                        const t = container.querySelector('label');
-                        if (t) mainQ = t.innerText.trim();
-                    }
-                    if (el.tagName === 'SELECT' && !mainQ) {
-                        const p = el.closest('div.field, div.custom_question');
-                        if (p) for (let l of p.querySelectorAll('label')) {
-                            if (l.innerText.trim() && l.innerText.trim() !== '*') { mainQ = l.innerText.trim(); break; }
-                        }
-                    }
-                    let label = labelEl ? labelEl.innerText.trim() : (el.name || el.id);
-                    if (mainQ && mainQ !== label) label = `${mainQ} - ${label}`;
+
+                    const container = el.closest('div.field-wrapper, div.field, div.custom_question');
+                    const labelEl   = document.querySelector(`label[for="${el.id}"]`)
+                                   || container?.querySelector('label');
+
+                    let label = labelEl ? labelEl.innerText.replace('*','').trim() : (el.name || el.id);
                     const isRequired = el.required
-                        || !!container?.querySelector('label.required, [aria-required="true"], abbr[title="required"]')
-                        || label.includes('*');
-                    let fi = { id: el.id, name: el.name, label, type: el.type || el.tagName.toLowerCase(), required: isRequired };
-                    if (el.tagName === 'SELECT') {
-                        fi.type = 'select';
-                        fi.options = Array.from(el.options).map(o => ({ value: o.value, text: o.text })).filter(o => o.value);
-                    }
-                    if (fi.type === 'radio' || fi.type === 'checkbox') {
-                        const ex = fields.find(f => f.name === fi.name);
-                        if (ex) { ex.options = ex.options || []; ex.options.push({ value: el.value, id: el.id, label }); return; }
+                        || el.getAttribute('aria-required') === 'true'
+                        || (labelEl && labelEl.innerText.includes('*'));
+
+                    let fi = { id: el.id, name: el.name, label, required: isRequired };
+
+                    if (el.getAttribute('role') === 'combobox') {
+                        // React Select — collect visible options from the container's
+                        // hidden select-equivalent or note it as react-select type
+                        fi.type = 'react-select';
+                        // Try to find options from a sibling hidden input or data
+                        // (Options are only in DOM when menu is open, so we just mark the type)
+                        fi.options = [];
+                    } else if (el.type === 'checkbox') {
+                        fi.type = 'checkbox';
+                        const existing = fields.find(f => f.name === fi.name);
+                        if (existing) {
+                            existing.options = existing.options || [];
+                            existing.options.push({ value: el.value, id: el.id, label });
+                            return;
+                        }
                         fi.options = [{ value: el.value, id: el.id, label }];
+                    } else if (el.type === 'radio') {
+                        fi.type = 'radio';
+                        const existing = fields.find(f => f.name === fi.name);
+                        if (existing) {
+                            existing.options = existing.options || [];
+                            existing.options.push({ value: el.value, id: el.id, label });
+                            return;
+                        }
+                        fi.options = [{ value: el.value, id: el.id, label }];
+                    } else {
+                        fi.type = 'text';
                     }
+
                     fields.push(fi);
                 });
                 return fields;
@@ -164,27 +210,33 @@ Candidate Profile:
 {json.dumps(candidate_profile)}
 
 CRITICAL INSTRUCTIONS:
-1. If asked for a LinkedIn profile, use the EXACT `linkedin` URL from the candidate profile. Do not output N/A.
-2. If asked for a GitHub or Portfolio, use the `github` or `portfolio` URL from the profile. Do not output N/A.
-3. If asked about work authorization, sponsorship, or visas, answer based on `work_auth`. If they require sponsorship now or in the future, select "Yes". If not, select "No".
-4. If asked about gender, race/ethnicity, veteran, or disability status, use exact values from `gender`, `hispanic`, `veteran`, and `disability` in the profile.
+1. If asked for a LinkedIn profile, use the EXACT `linkedin` URL from the candidate profile.
+2. If asked for a GitHub or Portfolio, use the `github` or `portfolio` URL from the profile.
+3. If asked about work authorization, sponsorship, or visas: if they need sponsorship, answer "Yes". If not, answer "No".
+4. If asked about gender, race/ethnicity, veteran, or disability: use `gender`, `hispanic`, `veteran`, `disability` from the profile.
 5. If asked "How did you hear about us", say "LinkedIn".
-6. For `checkbox` types, output the `id` of the checkbox to check from the options array.
-7. For `radio` types, output the `id` of the option to select from the options array.
-8. If asked about employment agreements, select "No".
-9. If asked "Have you ever been employed by GitLab", select "No".
-10. Answer "No" to non-compete agreement questions.
-11. Answer "No" or "None" to reasonable accommodation questions.
+6. For `checkbox` types, output the `id` of the checkbox to check.
+7. For `radio` types, output the `id` of the option to select.
+8. If asked about employment agreements or non-compete, answer "No".
+9. If asked "Have you ever been employed by GitLab", answer "No".
+10. Answer "No" or "None" to reasonable accommodation questions.
 
-IMPORTANT FOR SELECT FIELDS:
-- Each select field has an `options` array with `value` (hidden attribute) and `text` (visible label).
-- You MUST return the exact `value` string, NOT the text label.
-- Example: options=[{{"value":"1","text":"Yes"}},{{"value":"0","text":"No"}}] → return "0" for No.
+IMPORTANT FOR react-select FIELDS:
+- These are dropdown menus. Return the EXACT visible text of the option to select.
+- Example: for "Are you subject to employment agreements?" return "No"
+- Example: for "Will you require sponsorship?" return "No" (or "Yes" if applicable)
+- Example: for "What is your current country of residence?" return "India"
+- For gender: return the exact text like "Male", "Female", "Decline to self identify"
+- For veteran status: return the exact text like "I am not a protected veteran"
+- For disability: return the exact text like "No, I don't have a disability"
 
 Form Fields:
 {json.dumps(questions_data, indent=2)}
 
-Return a JSON object: keys = field `id` (or `name` if id empty), values = exact `value` to use.
+Return a JSON object: keys = field `id` (or `name` if id empty), values = the answer string.
+For react-select: value = exact visible option text to click.
+For checkbox/radio: value = the `id` of the option element to click.
+For text: value = the string to type.
 """
 
             client = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -195,73 +247,31 @@ Return a JSON object: keys = field `id` (or `name` if id empty), values = exact 
             )
             answers = json.loads(chat_completion.choices[0].message.content)
 
-            # ------------------------------------------------------------------ #
-            # KEY FIX: Split answers into two passes                              #
-            #   Pass 1 — location/country triggers (these cause form re-renders)  #
-            #   Pass 2 — everything else                                           #
-            #                                                                     #
-            # Filling a country dropdown causes Greenhouse to re-render the whole  #
-            # form (sponsorship/visa questions change based on country). Any select #
-            # filled BEFORE country gets wiped by that re-render. So we fill       #
-            # country first, wait for the re-render to settle, then fill the rest. #
-            # ------------------------------------------------------------------ #
-
-            def _is_location_trigger(fid: str, finfo: dict) -> bool:
-                if fid in LOCATION_TRIGGER_IDS:
-                    return True
-                label_lower = (finfo.get("label") or "").lower()
-                return any(kw in label_lower for kw in LOCATION_TRIGGER_LABELS)
-
-            # Build ordered list: location triggers first, rest second
-            trigger_items = []
-            other_items = []
             for field_id, answer_val in answers.items():
                 if not field_id:
                     continue
-                field_info = next(
-                    (f for f in questions_data if f['id'] == field_id or f['name'] == field_id),
-                    None
-                )
-                if not field_info:
-                    for q in questions_data:
-                        for opt in q.get('options', []):
-                            if opt.get('id') == field_id:
-                                field_info = q
-                                break
-                        if field_info:
-                            break
-                if not field_info:
-                    continue
-                if _is_location_trigger(field_id, field_info):
-                    trigger_items.append((field_id, answer_val, field_info))
-                else:
-                    other_items.append((field_id, answer_val, field_info))
-
-            ordered_items = trigger_items + other_items
-
-            # Store filled select values so we can re-fill in the final pass
-            filled_selects = {}  # selector -> matched_value
-
-            def fill_one(field_id, answer_val, field_info):
-                field_type = field_info['type']
-                selector = (
-                    f"[id='{field_info['id']}']" if field_info['id'] and "'" not in field_info['id']
-                    else f"[name='{field_info['name']}']"
-                )
                 try:
-                    if field_type == 'select':
-                        available_options = field_info.get('options', [])
-                        matched_value, match_type = _resolve_matched_value(str(answer_val), available_options)
-                        if matched_value is not None:
-                            if match_type != 'exact':
-                                result["logs"].append(f"{match_type}-matched '{answer_val}' -> '{matched_value}' for {field_id}")
-                            ok = _fill_select(page, selector, str(matched_value), result["logs"])
-                            if ok:
-                                filled_selects[selector] = str(matched_value)
-                            else:
-                                result["logs"].append(f"WARNING: Could not set {field_id}='{matched_value}'. Options: {available_options}")
-                        else:
-                            result["logs"].append(f"WARNING: No option match for {field_id} answer='{answer_val}'. Options: {available_options}")
+                    field_info = next(
+                        (f for f in questions_data if f['id'] == field_id or f['name'] == field_id),
+                        None
+                    )
+                    if not field_info:
+                        for q in questions_data:
+                            for opt in q.get('options', []):
+                                if opt.get('id') == field_id:
+                                    field_info = q
+                                    break
+                            if field_info:
+                                break
+                    if not field_info:
+                        continue
+
+                    field_type = field_info.get('type', 'text')
+
+                    if field_type == 'react-select':
+                        ok = _fill_react_select(page, field_info['id'], str(answer_val), result["logs"])
+                        if not ok:
+                            result["logs"].append(f"WARNING: react-select fill failed for {field_id} with '{answer_val}'")
 
                     elif field_type == 'checkbox':
                         page.locator(f"[id='{answer_val}']").click(force=True, timeout=5000)
@@ -272,52 +282,24 @@ Return a JSON object: keys = field `id` (or `name` if id empty), values = exact 
                         radio_el.evaluate("el => el.dispatchEvent(new Event('change', { bubbles: true }))")
 
                     else:
+                        selector = (
+                            f"[id='{field_info['id']}']" if field_info['id'] and "'" not in field_info['id']
+                            else f"[name='{field_info['name']}']"
+                        )
                         page.locator(selector).fill(str(answer_val), timeout=5000)
                         page.locator(selector).evaluate(
                             "el => el.dispatchEvent(new Event('blur', { bubbles: true }))"
                         )
 
                     result["logs"].append(f"Filled {field_id} with: {answer_val}")
+
                 except Exception as e:
                     result["logs"].append(f"Failed to fill {field_id}: {str(e)}")
-
-            # Pass 1: location triggers — fill and wait for re-render
-            for field_id, answer_val, field_info in trigger_items:
-                fill_one(field_id, answer_val, field_info)
-
-            if trigger_items:
-                result["logs"].append("Waiting for re-render after location/country fields...")
-                page.wait_for_load_state("networkidle")
-                page.wait_for_timeout(1000)
-
-            # Pass 2: everything else
-            for field_id, answer_val, field_info in other_items:
-                fill_one(field_id, answer_val, field_info)
-
-            # ------------------------------------------------------------------ #
-            # FINAL RE-FILL PASS: re-apply all selects after full settle wait     #
-            # Some React re-renders happen lazily after the last field is filled.  #
-            # Re-filling selects right before the screenshot guarantees they hold. #
-            # ------------------------------------------------------------------ #
-            page.wait_for_timeout(1500)
-            if filled_selects:
-                result["logs"].append(f"Re-fill pass: verifying {len(filled_selects)} select(s)...")
-                for selector, value in filled_selects.items():
-                    try:
-                        loc = page.locator(selector)
-                        actual = loc.evaluate("el => el.value")
-                        if actual != value:
-                            result["logs"].append(f"Re-fill: {selector} was '{actual}', re-setting to '{value}'")
-                            _fill_select(page, selector, value, result["logs"])
-                        else:
-                            result["logs"].append(f"Re-fill OK: {selector} = '{value}'")
-                    except Exception as e:
-                        result["logs"].append(f"Re-fill check failed for {selector}: {e}")
 
         except Exception as e:
             result["logs"].append(f"Error processing custom questions: {str(e)}")
 
-        page.wait_for_timeout(1000)
+        page.wait_for_timeout(1500)
 
         # Screenshot just before submit
         try:
