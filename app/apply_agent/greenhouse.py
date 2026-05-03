@@ -11,25 +11,31 @@ class GreenhouseApplyAgent(BaseApplyAgent):
         result["logs"].append(f"Navigating to {url}")
         page.goto(url)
         
+        # Wait for the page JS (React/Vue/jQuery) to fully initialize before touching any fields
+        page.wait_for_load_state("networkidle")
+        
         # Take a screenshot BEFORE filling so we can debug the initial state
         try:
             page.screenshot(path=f"data/debug_initial_{application.id}.png")
         except: pass
         
-        # Fill first name
+        # Fill first name and immediately dispatch blur so the framework registers the change
         page.fill("input#first_name", candidate_profile.get("first_name", ""))
+        page.locator("input#first_name").evaluate("el => el.dispatchEvent(new Event('blur', { bubbles: true }))")
         
         # Fill last name
         page.fill("input#last_name", candidate_profile.get("last_name", ""))
+        page.locator("input#last_name").evaluate("el => el.dispatchEvent(new Event('blur', { bubbles: true }))")
         
         # Fill email
         page.fill("input#email", candidate_profile.get("email", ""))
+        page.locator("input#email").evaluate("el => el.dispatchEvent(new Event('blur', { bubbles: true }))")
         
         # Fill phone
         page.fill("input#phone", candidate_profile.get("phone", ""))
+        page.locator("input#phone").evaluate("el => el.dispatchEvent(new Event('blur', { bubbles: true }))")
         
-        # Click outside to trigger validation on standard fields
-        page.keyboard.press("Escape")
+        # Small wait to let any validation/re-render settle after filling standard fields
         page.wait_for_timeout(500)
         
         # Upload resume
