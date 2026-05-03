@@ -6,27 +6,55 @@ import os
 from groq import Groq
 
 
-def _set_react_select(page, selector: str, value: str):
-    """Set a <select> value in a way that bypasses React's controlled-component state.
-    React tracks its own internal value and will reset the DOM value unless we trigger
-    its synthetic event system via the native property descriptor setter.
+def _click_select_option(page, selector: str, value: str, result_logs: list) -> bool:
     """
-    page.locator(selector).evaluate("""
-        (el, val) => {
-            // 1. Use the native HTMLSelectElement setter so React's synthetic event
-            //    system sees the change (not just a plain DOM assignment).
-            const nativeSetter = Object.getOwnPropertyDescriptor(
-                window.HTMLSelectElement.prototype, 'value'
-            ).set;
-            nativeSetter.call(el, val);
+    Fill a <select> by simulating real user interaction:
+      1. Focus the element
+      2. Use Playwright's select_option (handles both native and React-controlled selects)
+      3. Immediately re-read the value from DOM to confirm it actually stuck
+      4. If it didn't stick, retry once via the native property-descriptor setter trick
 
-            // 2. Fire all relevant events so React / Vue / jQuery / plain JS listeners
-            //    all pick it up.
-            el.dispatchEvent(new Event('input',  { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-            el.dispatchEvent(new Event('blur',   { bubbles: true }));
-        }
-    """, value)
+    Returns True if the value was confirmed set, False otherwise.
+    """
+    loc = page.locator(selector)
+
+    # --- Attempt 1: Playwright select_option (works for most cases) ---
+    try:
+        loc.focus(timeout=3000)
+        loc.select_option(value=value, timeout=5000)
+        page.wait_for_timeout(300)  # Let React process the synthetic event
+
+        actual = loc.evaluate("el => el.value")
+        if actual == value:
+            return True
+        result_logs.append(f"select_option set '{value}' but DOM reads '{actual}', trying native setter...")
+    except Exception as e:
+        result_logs.append(f"select_option failed ({e}), trying native setter...")
+
+    # --- Attempt 2: Native HTMLSelectElement property-descriptor setter ---
+    # React bypasses the DOM setter, so we go through the prototype chain directly.
+    try:
+        loc.evaluate("""
+            (el, val) => {
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLSelectElement.prototype, 'value'
+                ).set;
+                nativeSetter.call(el, val);
+                ['input', 'change', 'blur'].forEach(evtName =>
+                    el.dispatchEvent(new Event(evtName, { bubbles: true }))
+                );
+            }
+        """, value)
+        page.wait_for_timeout(300)
+
+        actual = loc.evaluate("el => el.value")
+        if actual == value:
+            return True
+        result_logs.append(f"Native setter set '{value}' but DOM still reads '{actual}'. Giving up.")
+    except Exception as e:
+        result_logs.append(f"Native setter also failed: {e}")
+
+    return False
 
 
 class GreenhouseApplyAgent(BaseApplyAgent):
@@ -34,16 +62,13 @@ class GreenhouseApplyAgent(BaseApplyAgent):
         url = application.job.url
         result["logs"].append(f"Navigating to {url}")
         page.goto(url)
-
-        # Wait for the page JS (React/Vue/jQuery) to fully initialize before touching any fields
         page.wait_for_load_state("networkidle")
 
-        # Take a screenshot BEFORE filling so we can debug the initial state
         try:
             page.screenshot(path=f"data/debug_initial_{application.id}.png")
-        except: pass
+        except:
+            pass
 
-        # Helper to fill a standard text input and notify the framework
         def fill_and_blur(selector: str, value: str):
             page.fill(selector, value)
             page.locator(selector).evaluate("el => el.dispatchEvent(new Event('blur', { bubbles: true }))")
@@ -52,8 +77,6 @@ class GreenhouseApplyAgent(BaseApplyAgent):
         fill_and_blur("input#last_name",  candidate_profile.get("last_name",  ""))
         fill_and_blur("input#email",      candidate_profile.get("email",      ""))
         fill_and_blur("input#phone",      candidate_profile.get("phone",      ""))
-
-        # Small wait to let any validation/re-render settle after filling standard fields
         page.wait_for_timeout(500)
 
         # Upload resume
@@ -66,8 +89,7 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                 if attach_button.count() > 0:
                     with page.expect_file_chooser() as fc_info:
                         attach_button.click()
-                    file_chooser = fc_info.value
-                    file_chooser.set_files(application.tailored_resume_pdf_path)
+                    fc_info.value.set_files(application.tailored_resume_pdf_path)
 
         # ------------------------------------------------------------------ #
         #  Answer Custom Questions using Groq                                 #
@@ -117,11 +139,8 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                         || !!container?.querySelector('label.required, [aria-required="true"], abbr[title="required"]')
                         || label.includes('*');
 
-                    let fi = {
-                        id: el.id, name: el.name, label,
-                        type: el.type || el.tagName.toLowerCase(),
-                        required: isRequired
-                    };
+                    let fi = { id: el.id, name: el.name, label,
+                               type: el.type || el.tagName.toLowerCase(), required: isRequired };
 
                     if (el.tagName === 'SELECT') {
                         fi.type = 'select';
@@ -191,7 +210,6 @@ Return a JSON object: keys = field `id` (or `name` if id empty), values = exact 
                     if not field_id:
                         continue
                     try:
-                        # Resolve field_info
                         field_info = next(
                             (f for f in questions_data if f['id'] == field_id or f['name'] == field_id),
                             None
@@ -216,12 +234,11 @@ Return a JSON object: keys = field `id` (or `name` if id empty), values = exact 
                         if field_type == 'select':
                             available_options = field_info.get('options', [])
 
-                            # 1. Exact value match
+                            # Resolve answer value → actual <option value=...>
                             matched_value = next(
                                 (o['value'] for o in available_options if str(o['value']) == str(answer_val)),
                                 None
                             )
-                            # 2. Case-insensitive label match
                             if matched_value is None:
                                 matched_value = next(
                                     (o['value'] for o in available_options
@@ -230,7 +247,6 @@ Return a JSON object: keys = field `id` (or `name` if id empty), values = exact 
                                 )
                                 if matched_value is not None:
                                     result["logs"].append(f"Label-matched '{answer_val}' -> '{matched_value}' for {field_id}")
-                            # 3. Partial text match
                             if matched_value is None:
                                 matched_value = next(
                                     (o['value'] for o in available_options
@@ -241,12 +257,16 @@ Return a JSON object: keys = field `id` (or `name` if id empty), values = exact 
                                     result["logs"].append(f"Partial-matched '{answer_val}' -> '{matched_value}' for {field_id}")
 
                             if matched_value is not None:
-                                # Use React-aware native setter instead of plain select_option
-                                _set_react_select(page, selector, str(matched_value))
+                                ok = _click_select_option(page, selector, str(matched_value), result["logs"])
+                                if not ok:
+                                    result["logs"].append(
+                                        f"WARNING: Could not reliably set {field_id}='{matched_value}'. "
+                                        f"Available: {available_options}"
+                                    )
                             else:
                                 result["logs"].append(
-                                    f"WARNING: No match for {field_id} answer='{answer_val}'. "
-                                    f"Options: {available_options}"
+                                    f"WARNING: No option match for {field_id} answer='{answer_val}'. "
+                                    f"Available: {available_options}"
                                 )
 
                         elif field_type == 'checkbox':
@@ -271,26 +291,43 @@ Return a JSON object: keys = field `id` (or `name` if id empty), values = exact 
         except Exception as e:
             result["logs"].append(f"Error processing custom questions: {str(e)}")
 
-        # Wait for any re-renders after filling all fields
+        # Give React time to settle after all fields are filled
         page.wait_for_timeout(2000)
+
+        # ------------------------------------------------------------------ #
+        #  Re-verify all select fields AFTER the settle wait                  #
+        #  (React sometimes resets them on the next render cycle)             #
+        # ------------------------------------------------------------------ #
+        try:
+            page.evaluate("""() => {
+                // Log current values of all visible selects to the page title temporarily
+                const selects = document.querySelectorAll('select:not([hidden])');
+                selects.forEach(s => {
+                    console.log('SELECT', s.id || s.name, '=', s.value);
+                });
+            }""")
+        except:
+            pass
 
         # Screenshot just before submit
         try:
             page.screenshot(path=f"data/debug_before_submit_{application.id}.png", full_page=True)
             result["logs"].append(f"Saved debug screenshot: data/debug_before_submit_{application.id}.png")
-        except: pass
+        except:
+            pass
 
         # Block submit if required fields still show validation errors
         try:
             raw_errors = page.locator(
                 ".field_with_errors, [class*='error']:visible, [class*='invalid']:visible"
             ).all_inner_texts()
-            blocking_errors = [e.strip() for e in raw_errors if "This field is required" in e]
-            if blocking_errors:
-                result["logs"].append(f"BLOCKED SUBMIT: Validation errors: {blocking_errors}")
+            blocking = [e.strip() for e in raw_errors if "This field is required" in e]
+            if blocking:
+                result["logs"].append(f"BLOCKED SUBMIT: Validation errors: {blocking}")
                 result["status"] = "VALIDATION_FAILED"
                 return
-        except: pass
+        except:
+            pass
 
         page.wait_for_timeout(1000)
 
@@ -308,7 +345,8 @@ Return a JSON object: keys = field `id` (or `name` if id empty), values = exact 
                         if error_texts:
                             result["logs"].append(f"VALIDATION ERRORS FOUND AFTER SUBMIT: {error_texts}")
                             result["status"] = "VALIDATION_FAILED"
-                    except: pass
+                    except:
+                        pass
             else:
                 result["logs"].append("Could not find submit button. Submission failed.")
         except Exception as e:
