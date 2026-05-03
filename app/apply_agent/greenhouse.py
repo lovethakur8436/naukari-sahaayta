@@ -5,6 +5,30 @@ import json
 import os
 from groq import Groq
 
+
+def _set_react_select(page, selector: str, value: str):
+    """Set a <select> value in a way that bypasses React's controlled-component state.
+    React tracks its own internal value and will reset the DOM value unless we trigger
+    its synthetic event system via the native property descriptor setter.
+    """
+    page.locator(selector).evaluate("""
+        (el, val) => {
+            // 1. Use the native HTMLSelectElement setter so React's synthetic event
+            //    system sees the change (not just a plain DOM assignment).
+            const nativeSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLSelectElement.prototype, 'value'
+            ).set;
+            nativeSetter.call(el, val);
+
+            // 2. Fire all relevant events so React / Vue / jQuery / plain JS listeners
+            //    all pick it up.
+            el.dispatchEvent(new Event('input',  { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event('blur',   { bubbles: true }));
+        }
+    """, value)
+
+
 class GreenhouseApplyAgent(BaseApplyAgent):
     def run_apply_flow(self, page: Page, application: Application, candidate_profile: dict, result: dict):
         url = application.job.url
@@ -19,21 +43,15 @@ class GreenhouseApplyAgent(BaseApplyAgent):
             page.screenshot(path=f"data/debug_initial_{application.id}.png")
         except: pass
 
-        # Fill first name and immediately dispatch blur so the framework registers the change
-        page.fill("input#first_name", candidate_profile.get("first_name", ""))
-        page.locator("input#first_name").evaluate("el => el.dispatchEvent(new Event('blur', { bubbles: true }))")
+        # Helper to fill a standard text input and notify the framework
+        def fill_and_blur(selector: str, value: str):
+            page.fill(selector, value)
+            page.locator(selector).evaluate("el => el.dispatchEvent(new Event('blur', { bubbles: true }))")
 
-        # Fill last name
-        page.fill("input#last_name", candidate_profile.get("last_name", ""))
-        page.locator("input#last_name").evaluate("el => el.dispatchEvent(new Event('blur', { bubbles: true }))")
-
-        # Fill email
-        page.fill("input#email", candidate_profile.get("email", ""))
-        page.locator("input#email").evaluate("el => el.dispatchEvent(new Event('blur', { bubbles: true }))")
-
-        # Fill phone
-        page.fill("input#phone", candidate_profile.get("phone", ""))
-        page.locator("input#phone").evaluate("el => el.dispatchEvent(new Event('blur', { bubbles: true }))")
+        fill_and_blur("input#first_name", candidate_profile.get("first_name", ""))
+        fill_and_blur("input#last_name",  candidate_profile.get("last_name",  ""))
+        fill_and_blur("input#email",      candidate_profile.get("email",      ""))
+        fill_and_blur("input#phone",      candidate_profile.get("phone",      ""))
 
         # Small wait to let any validation/re-render settle after filling standard fields
         page.wait_for_timeout(500)
@@ -51,11 +69,19 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                     file_chooser = fc_info.value
                     file_chooser.set_files(application.tailored_resume_pdf_path)
 
-        # Answer Custom Questions using Groq (free tier, 14,400 req/day)
+        # ------------------------------------------------------------------ #
+        #  Answer Custom Questions using Groq                                 #
+        # ------------------------------------------------------------------ #
         try:
             questions_data = page.evaluate("""() => {
                 const fields = [];
-                const elements = document.querySelectorAll('select:not([hidden]):not([style*="display: none"]), input[type="text"]:not([hidden]):not([style*="display: none"]), textarea:not([hidden]):not([style*="display: none"]), input[type="checkbox"]:not([hidden]):not([style*="display: none"]), input[type="radio"]:not([hidden]):not([style*="display: none"])');
+                const elements = document.querySelectorAll(
+                    'select:not([hidden]):not([style*="display: none"]),'
+                    + 'input[type="text"]:not([hidden]):not([style*="display: none"]),'
+                    + 'textarea:not([hidden]):not([style*="display: none"]),'
+                    + 'input[type="checkbox"]:not([hidden]):not([style*="display: none"]),'
+                    + 'input[type="radio"]:not([hidden]):not([style*="display: none"])'
+                );
 
                 elements.forEach(el => {
                     if (['first_name', 'last_name', 'email', 'phone'].includes(el.id)) return;
@@ -63,19 +89,18 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                     if (el.offsetWidth === 0 || el.offsetHeight === 0) return;
 
                     const container = el.closest('div.field, div.custom_question');
-                    const labelEl = container?.querySelector('label') || document.querySelector(`label[for="${el.id}"]`);
+                    const labelEl   = container?.querySelector('label')
+                                   || document.querySelector(`label[for="${el.id}"]`);
 
-                    let mainQuestionLabel = "";
+                    let mainQuestionLabel = '';
                     if (['radio', 'checkbox', 'select'].includes(el.type) && container) {
                         const topLabel = container.querySelector('label');
                         if (topLabel) mainQuestionLabel = topLabel.innerText.trim();
                     }
-
                     if (el.tagName === 'SELECT' && !mainQuestionLabel) {
                         const parentDiv = el.closest('div.field, div.custom_question');
                         if (parentDiv) {
-                            const potentialLabels = parentDiv.querySelectorAll('label');
-                            for (let lbl of potentialLabels) {
+                            for (let lbl of parentDiv.querySelectorAll('label')) {
                                 if (lbl.innerText.trim() && lbl.innerText.trim() !== '*') {
                                     mainQuestionLabel = lbl.innerText.trim();
                                     break;
@@ -85,31 +110,37 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                     }
 
                     let label = labelEl ? labelEl.innerText.trim() : (el.name || el.id);
-                    if (mainQuestionLabel && mainQuestionLabel !== label) label = `${mainQuestionLabel} - ${label}`;
+                    if (mainQuestionLabel && mainQuestionLabel !== label)
+                        label = `${mainQuestionLabel} - ${label}`;
 
-                    // Check if field is required
-                    const isRequired = el.required || !!container?.querySelector('label.required, [aria-required="true"], abbr[title="required"]') || label.includes('*');
+                    const isRequired = el.required
+                        || !!container?.querySelector('label.required, [aria-required="true"], abbr[title="required"]')
+                        || label.includes('*');
 
-                    let field_info = { id: el.id, name: el.name, label: label, type: el.type || el.tagName.toLowerCase(), required: isRequired };
+                    let fi = {
+                        id: el.id, name: el.name, label,
+                        type: el.type || el.tagName.toLowerCase(),
+                        required: isRequired
+                    };
 
                     if (el.tagName === 'SELECT') {
-                        field_info.type = 'select';
-                        // Include BOTH value and text so the LLM can match by label if needed
-                        field_info.options = Array.from(el.options).map(o => ({ value: o.value, text: o.text })).filter(o => o.value);
+                        fi.type = 'select';
+                        fi.options = Array.from(el.options)
+                            .map(o => ({ value: o.value, text: o.text }))
+                            .filter(o => o.value);
                     }
 
-                    if (field_info.type === 'radio' || field_info.type === 'checkbox') {
-                        const existing = fields.find(f => f.name === field_info.name);
+                    if (fi.type === 'radio' || fi.type === 'checkbox') {
+                        const existing = fields.find(f => f.name === fi.name);
                         if (existing) {
-                            if (!existing.options) existing.options = [];
-                            existing.options.push({ value: el.value, id: el.id, label: label });
+                            existing.options = existing.options || [];
+                            existing.options.push({ value: el.value, id: el.id, label });
                             return;
-                        } else {
-                            field_info.options = [{ value: el.value, id: el.id, label: label }];
                         }
+                        fi.options = [{ value: el.value, id: el.id, label }];
                     }
 
-                    fields.push(field_info);
+                    fields.push(fi);
                 });
                 return fields;
             }""")
@@ -118,37 +149,35 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                 result["logs"].append(f"Found {len(questions_data)} custom questions. Asking Groq for answers...")
 
                 prompt = f"""
-                You are helping a candidate fill out a job application form.
-                Based on the candidate's profile, answer the following custom form fields.
+You are helping a candidate fill out a job application form.
+Based on the candidate's profile, answer the following custom form fields.
 
-                Candidate Profile:
-                {json.dumps(candidate_profile)}
+Candidate Profile:
+{json.dumps(candidate_profile)}
 
-                CRITICAL INSTRUCTIONS:
-                1. If asked for a LinkedIn profile, use the EXACT `linkedin` URL from the candidate profile. Do not output N/A.
-                2. If asked for a GitHub or Portfolio, use the `github` or `portfolio` URL from the profile. Do not output N/A.
-                3. If asked about work authorization, sponsorship, or visas, answer based on `work_auth`. If they require sponsorship now or in the future, select "Yes" for those questions. If they do not require sponsorship, select "No".
-                4. If asked about gender, race/ethnicity, veteran, or disability status, use the exact values from `gender`, `hispanic`, `veteran`, and `disability` in the profile. Note that "No" might correspond to "No, I do not have a disability" or "I am not a protected veteran". Match the semantic meaning.
-                5. If asked "How did you hear about us", say "LinkedIn".
-                6. For `checkbox` types (like Data Privacy Consent, Acknowledgements), output the `id` of the checkbox to be checked. Look at the options array to find the correct `id`.
-                7. For `radio` types, output the `id` of the option to be selected. Look closely at the `label` for each option to decide.
-                8. If asked "Are you subject to any employment agreements", select the option corresponding to "No".
-                9. If asked "Have you ever been employed by GitLab", select the option corresponding to "No".
-                10. Answer "No" to any questions regarding non-compete agreements.
-                11. Answer "No" or "None" to questions regarding reasonable accommodations for the interview process.
+CRITICAL INSTRUCTIONS:
+1. If asked for a LinkedIn profile, use the EXACT `linkedin` URL from the candidate profile. Do not output N/A.
+2. If asked for a GitHub or Portfolio, use the `github` or `portfolio` URL from the profile. Do not output N/A.
+3. If asked about work authorization, sponsorship, or visas, answer based on `work_auth`. If they require sponsorship now or in the future, select "Yes". If not, select "No".
+4. If asked about gender, race/ethnicity, veteran, or disability status, use exact values from `gender`, `hispanic`, `veteran`, and `disability` in the profile.
+5. If asked "How did you hear about us", say "LinkedIn".
+6. For `checkbox` types, output the `id` of the checkbox to check from the options array.
+7. For `radio` types, output the `id` of the option to select from the options array.
+8. If asked about employment agreements, select "No".
+9. If asked "Have you ever been employed by GitLab", select "No".
+10. Answer "No" to non-compete agreement questions.
+11. Answer "No" or "None" to reasonable accommodation questions.
 
-                IMPORTANT FOR SELECT FIELDS:
-                - Each select field has an `options` array with BOTH `value` (the hidden attribute) and `text` (the visible label).
-                - You MUST return the exact `value` string from the options array, NOT the text label.
-                - Example: if options are [{{"value": "1", "text": "Yes"}}, {{"value": "0", "text": "No"}}] and the answer is No, return "0" not "No".
-                - Always look at the options array and pick the value whose text best matches your intended answer.
+IMPORTANT FOR SELECT FIELDS:
+- Each select field has an `options` array with `value` (hidden attribute) and `text` (visible label).
+- You MUST return the exact `value` string, NOT the text label.
+- Example: options=[{{"value":"1","text":"Yes"}},{{"value":"0","text":"No"}}] → return "0" for No.
 
-                Form Fields to answer:
-                {json.dumps(questions_data, indent=2)}
+Form Fields:
+{json.dumps(questions_data, indent=2)}
 
-                Return a JSON object where keys are the field `id` (or `name` if id is empty), and values are the exact `value` to use.
-                For select types, always return the `value` attribute from the options array.
-                """
+Return a JSON object: keys = field `id` (or `name` if id empty), values = exact `value` to use.
+"""
 
                 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
                 chat_completion = client.chat.completions.create(
@@ -159,73 +188,83 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                 answers = json.loads(chat_completion.choices[0].message.content)
 
                 for field_id, answer_val in answers.items():
-                    if not field_id: continue
+                    if not field_id:
+                        continue
                     try:
-                        field_info = next((f for f in questions_data if f['id'] == field_id or f['name'] == field_id), None)
-
+                        # Resolve field_info
+                        field_info = next(
+                            (f for f in questions_data if f['id'] == field_id or f['name'] == field_id),
+                            None
+                        )
                         if not field_info:
                             for q in questions_data:
-                                if q.get('options'):
-                                    for opt in q['options']:
-                                        if opt.get('id') == field_id:
-                                            field_info = q
-                                            break
-
+                                for opt in q.get('options', []):
+                                    if opt.get('id') == field_id:
+                                        field_info = q
+                                        break
+                                if field_info:
+                                    break
                         if not field_info:
                             continue
 
                         field_type = field_info['type']
+                        selector = (
+                            f"[id='{field_info['id']}']" if field_info['id'] and "'" not in field_info['id']
+                            else f"[name='{field_info['name']}']"
+                        )
 
                         if field_type == 'select':
-                            selector = f"[id='{field_info['id']}']" if "'" not in field_info['id'] else f"[name='{field_info['name']}']"
                             available_options = field_info.get('options', [])
 
-                            # Primary: try the value returned by Groq directly
-                            matched_value = None
-                            for opt in available_options:
-                                if str(opt['value']) == str(answer_val):
-                                    matched_value = opt['value']
-                                    break
-
-                            # Fallback: if Groq returned a label text instead of value, match by text (case-insensitive)
-                            if not matched_value:
-                                for opt in available_options:
-                                    if opt['text'].strip().lower() == str(answer_val).strip().lower():
-                                        matched_value = opt['value']
-                                        result["logs"].append(f"Label-matched '{answer_val}' → value='{matched_value}' for {field_id}")
-                                        break
-
-                            # Last resort: partial text match
-                            if not matched_value:
-                                for opt in available_options:
-                                    if str(answer_val).strip().lower() in opt['text'].strip().lower():
-                                        matched_value = opt['value']
-                                        result["logs"].append(f"Partial-matched '{answer_val}' → value='{matched_value}' for {field_id}")
-                                        break
+                            # 1. Exact value match
+                            matched_value = next(
+                                (o['value'] for o in available_options if str(o['value']) == str(answer_val)),
+                                None
+                            )
+                            # 2. Case-insensitive label match
+                            if matched_value is None:
+                                matched_value = next(
+                                    (o['value'] for o in available_options
+                                     if o['text'].strip().lower() == str(answer_val).strip().lower()),
+                                    None
+                                )
+                                if matched_value is not None:
+                                    result["logs"].append(f"Label-matched '{answer_val}' -> '{matched_value}' for {field_id}")
+                            # 3. Partial text match
+                            if matched_value is None:
+                                matched_value = next(
+                                    (o['value'] for o in available_options
+                                     if str(answer_val).strip().lower() in o['text'].strip().lower()),
+                                    None
+                                )
+                                if matched_value is not None:
+                                    result["logs"].append(f"Partial-matched '{answer_val}' -> '{matched_value}' for {field_id}")
 
                             if matched_value is not None:
-                                page.locator(selector).select_option(value=str(matched_value), timeout=5000, force=True)
-                                page.locator(selector).evaluate("""el => {
-                                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                                    el.dispatchEvent(new Event('blur', { bubbles: true }));
-                                }""")
+                                # Use React-aware native setter instead of plain select_option
+                                _set_react_select(page, selector, str(matched_value))
                             else:
-                                result["logs"].append(f"WARNING: Could not match any option for {field_id} with answer '{answer_val}'. Available: {available_options}")
+                                result["logs"].append(
+                                    f"WARNING: No match for {field_id} answer='{answer_val}'. "
+                                    f"Options: {available_options}"
+                                )
 
                         elif field_type == 'checkbox':
-                            checkbox_el = page.locator(f"[id='{answer_val}']")
-                            checkbox_el.click(force=True, timeout=5000)
+                            page.locator(f"[id='{answer_val}']").click(force=True, timeout=5000)
+
                         elif field_type == 'radio':
                             radio_el = page.locator(f"[id='{answer_val}']")
                             radio_el.click(force=True, timeout=5000)
                             radio_el.evaluate("el => el.dispatchEvent(new Event('change', { bubbles: true }))")
+
                         else:
-                            selector = f"[id='{field_info['id']}']" if "'" not in field_info['id'] else f"[name='{field_info['name']}']"
                             page.locator(selector).fill(str(answer_val), timeout=5000)
-                            page.locator(selector).evaluate("el => el.dispatchEvent(new Event('blur', { bubbles: true }))")
+                            page.locator(selector).evaluate(
+                                "el => el.dispatchEvent(new Event('blur', { bubbles: true }))"
+                            )
 
                         result["logs"].append(f"Filled {field_id} with: {answer_val}")
+
                     except Exception as e:
                         result["logs"].append(f"Failed to fill {field_id}: {str(e)}")
 
@@ -235,25 +274,27 @@ class GreenhouseApplyAgent(BaseApplyAgent):
         # Wait for any re-renders after filling all fields
         page.wait_for_timeout(2000)
 
-        # Take a screenshot right before clicking submit
+        # Screenshot just before submit
         try:
             page.screenshot(path=f"data/debug_before_submit_{application.id}.png", full_page=True)
             result["logs"].append(f"Saved debug screenshot: data/debug_before_submit_{application.id}.png")
         except: pass
 
-        # Check for validation errors BEFORE submitting — do not submit if required fields are empty
+        # Block submit if required fields still show validation errors
         try:
-            validation_errors = page.locator(".field_with_errors, .error, [class*='error']:visible, [class*='invalid']:visible").all_inner_texts()
-            validation_errors = [e.strip() for e in validation_errors if e.strip() and "This field is required" in e]
-            if validation_errors:
-                result["logs"].append(f"BLOCKED SUBMIT: Validation errors still present: {validation_errors}")
+            raw_errors = page.locator(
+                ".field_with_errors, [class*='error']:visible, [class*='invalid']:visible"
+            ).all_inner_texts()
+            blocking_errors = [e.strip() for e in raw_errors if "This field is required" in e]
+            if blocking_errors:
+                result["logs"].append(f"BLOCKED SUBMIT: Validation errors: {blocking_errors}")
                 result["status"] = "VALIDATION_FAILED"
                 return
         except: pass
 
         page.wait_for_timeout(1000)
 
-        # Finally submit
+        # Submit
         try:
             submit_btn = page.locator("input#submit_app, button#submit_app, button[type='submit']")
             if submit_btn.count() > 0:
@@ -261,7 +302,6 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                 result["logs"].append("Clicked actual submit button! Application sent.")
                 page.wait_for_timeout(4000)
 
-                # Verify if we actually left the application page
                 if "application" in page.url or "jobs" in page.url:
                     try:
                         error_texts = page.locator(".error-message, .field_with_errors").all_inner_texts()
