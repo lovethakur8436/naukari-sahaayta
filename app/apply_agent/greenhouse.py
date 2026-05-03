@@ -3,7 +3,7 @@ from app.apply_agent.base import BaseApplyAgent
 from app.models.application import Application
 import json
 import os
-import google.generativeai as genai
+from groq import Groq
 
 class GreenhouseApplyAgent(BaseApplyAgent):
     def run_apply_flow(self, page: Page, application: Application, candidate_profile: dict, result: dict):
@@ -53,7 +53,7 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                     file_chooser = fc_info.value
                     file_chooser.set_files(application.tailored_resume_pdf_path)
         
-        # Answer Custom Questions using Gemini
+        # Answer Custom Questions using Groq (free tier, 14,400 req/day)
         try:
             questions_data = page.evaluate("""() => {
                 const fields = [];
@@ -121,7 +121,7 @@ class GreenhouseApplyAgent(BaseApplyAgent):
             }""")
             
             if questions_data:
-                result["logs"].append(f"Found {len(questions_data)} custom questions. Asking Gemini for answers...")
+                result["logs"].append(f"Found {len(questions_data)} custom questions. Asking Groq for answers...")
                 
                 prompt = f"""
                 You are helping a candidate fill out a job application form.
@@ -150,11 +150,14 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                 For `select` types, you MUST provide the exact `value` from the provided options array. DO NOT provide the label text, provide the hidden `value` attribute.
                 """
                 
-                genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-                model = genai.GenerativeModel('gemini-2.5-pro', generation_config={"response_mime_type": "application/json"})
-                response = model.generate_content(prompt)
-                
-                answers = json.loads(response.text)
+                # Use Groq with llama-3.1-8b-instant — free tier: 14,400 req/day, JSON mode supported
+                client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+                chat_completion = client.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="llama-3.3-70b-versatile",
+                    response_format={"type": "json_object"},
+                )
+                answers = json.loads(chat_completion.choices[0].message.content)
                 
                 for field_id, answer_val in answers.items():
                     if not field_id: continue
@@ -162,7 +165,7 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                         # Find the field type from our scraped data
                         field_info = next((f for f in questions_data if f['id'] == field_id or f['name'] == field_id), None)
                         
-                        # In case Gemini returns the ID of a specific radio button instead of the group name
+                        # In case Groq returns the ID of a specific radio button instead of the group name
                         if not field_info:
                             for q in questions_data:
                                 if q.get('options'):
@@ -177,10 +180,8 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                         field_type = field_info['type']
                         
                         if field_type == 'select':
-                            # For select, Gemini must return the value, not the text
+                            # For select, Groq must return the value, not the text
                             selector = f"[id='{field_info['id']}']" if "'" not in field_info['id'] else f"[name='{field_info['name']}']"
-                            # In Greenhouse, some selects are styled with select2 or chosen plugins.
-                            # Standard select_option works on the hidden select, but we should force it.
                             page.locator(selector).select_option(value=str(answer_val), timeout=5000, force=True)
                             
                             # Fire multiple events to ensure React/Vue/jQuery plugins catch the change
@@ -190,23 +191,15 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                                 el.dispatchEvent(new Event('blur', { bubbles: true }));
                             }""")
                         elif field_type == 'checkbox':
-                            # Gemini now returns the ID of the checkbox it wants to check
                             checkbox_el = page.locator(f"[id='{answer_val}']")
                             checkbox_el.click(force=True, timeout=5000)
                         elif field_type == 'radio':
-                            # For radio, Gemini should return the ID of the specific radio button
-                            # Wait for the specific radio element, ensure it's visible, and click its parent label or itself
                             radio_el = page.locator(f"[id='{answer_val}']")
-                            # Radio buttons in Greenhouse are often hidden visually with CSS, and you must click the label
                             radio_el.click(force=True, timeout=5000)
-                            
-                            # Fire change event on radio
                             radio_el.evaluate("el => el.dispatchEvent(new Event('change', { bubbles: true }))")
                         else:
                             selector = f"[id='{field_info['id']}']" if "'" not in field_info['id'] else f"[name='{field_info['name']}']"
                             page.locator(selector).fill(str(answer_val), timeout=5000)
-                            
-                            # Fire blur event for text inputs in case of validation triggers
                             page.locator(selector).evaluate("el => el.dispatchEvent(new Event('blur', { bubbles: true }))")
                             
                         result["logs"].append(f"Filled {field_id} with: {answer_val}")
@@ -230,12 +223,10 @@ class GreenhouseApplyAgent(BaseApplyAgent):
             if submit_btn.count() > 0:
                 submit_btn.first.click()
                 result["logs"].append("Clicked actual submit button! Application sent.")
-                # Wait briefly for success page to load so the screenshot captures it
                 page.wait_for_timeout(4000)
                 
                 # Verify if we actually left the application page
                 if "application" in page.url or "jobs" in page.url:
-                    # We might still be on the same page due to a validation error
                     try:
                         error_texts = page.locator(".error-message, .field_with_errors").all_inner_texts()
                         if error_texts:
