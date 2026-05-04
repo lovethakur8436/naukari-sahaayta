@@ -175,10 +175,11 @@ Bachelor of Technology, Computer Science Engineering 2018 – 2022""")
 with tab1:
     st.header("Ingested Jobs")
     try:
-        jobs = requests.get(f"{API_URL}/jobs").json()
+        jobs = requests.get(f"{API_URL}/jobs", params={"limit": 1000}).json()
         if jobs:
+            st.caption(f"Total jobs in DB: {len(jobs)}")
             df_jobs = pd.DataFrame(jobs)
-            st.dataframe(df_jobs[["id", "portal", "company", "title", "location"]])
+            st.dataframe(df_jobs[["id", "portal", "company", "title", "location"]], use_container_width=True)
         else:
             st.info("No jobs found. Go to Setup to ingest.")
     except Exception as e:
@@ -192,7 +193,7 @@ with tab2:
         
     try:
         apps = requests.get(f"{API_URL}/applications").json()
-        jobs_req = requests.get(f"{API_URL}/jobs").json()
+        jobs_req = requests.get(f"{API_URL}/jobs", params={"limit": 1000}).json()
         job_map = {j["id"]: j for j in jobs_req} if jobs_req else {}
         
         if apps:
