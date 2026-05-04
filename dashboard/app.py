@@ -142,9 +142,27 @@ Bachelor of Technology, Computer Science Engineering 2018 – 2022""")
   ]
 }''')
 
+    st.subheader("Ingest Jobs")
+    greenhouse_input = st.text_input(
+        "Greenhouse companies to ingest (comma-separated slugs)",
+        value="gitlab",
+        help="e.g. gitlab, stripe, figma, notion"
+    )
+    greenhouse_tokens = [t.strip() for t in greenhouse_input.split(",") if t.strip()]
+
     if st.button("Trigger Ingest"):
-        res = requests.post(f"{API_URL}/jobs/ingest")
-        st.success(res.json()["message"])
+        with st.spinner("Ingesting jobs..."):
+            res = requests.post(
+                f"{API_URL}/jobs/ingest",
+                json={"greenhouse": greenhouse_tokens, "lever": []},
+                headers={"Content-Type": "application/json"}
+            )
+            data = res.json()
+            if res.status_code == 200:
+                st.success(data.get("message", "Ingested successfully"))
+                st.caption(f"Companies scraped: {', '.join(data.get('companies_scraped', []))}")
+            else:
+                st.error(f"Error {res.status_code}: {data.get('detail', str(data))}")
         
     if st.button("Trigger Global Match"):
         with st.spinner("Matching in progress (processing 5 jobs)..."):
@@ -187,7 +205,6 @@ with tab2:
                 with st.expander(f"App #{app['id']} | {company} - {title} | {location} | Fit: {app['fit_score']}"):
                     st.write(f"**Role Details:** {title} @ {company} ({location})")
                     
-                    # Highlight status
                     status_color = "blue"
                     if app['status'] == 'AUTO_APPLIED': status_color = "green"
                     elif app['status'] == 'FAILED': status_color = "red"
@@ -225,7 +242,6 @@ with tab2:
                             res = requests.post(f"{API_URL}/applications/{app['id']}/apply", json=profile)
                             st.success("Apply process started! Wait a few seconds and click 'Refresh Applications' above.")
                             
-                    # Show logs if they exist
                     if app.get('submission_log_json_path'):
                         try:
                             with open(app['submission_log_json_path'], 'r') as f:
