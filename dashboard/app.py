@@ -187,6 +187,8 @@ with tab1:
 
 with tab2:
     st.header("Application Queue")
+
+    FIT_SCORE_THRESHOLD = 60
     
     if st.button("Refresh Applications"):
         st.rerun()
@@ -197,7 +199,18 @@ with tab2:
         job_map = {j["id"]: j for j in jobs_req} if jobs_req else {}
         
         if apps:
-            for app in apps:
+            qualified = [a for a in apps if (a.get("fit_score") or 0) > FIT_SCORE_THRESHOLD]
+            hidden_count = len(apps) - len(qualified)
+
+            st.caption(
+                f"Showing **{len(qualified)}** applications with fit score > {FIT_SCORE_THRESHOLD}"
+                + (f" · {hidden_count} low-score apps hidden" if hidden_count > 0 else "")
+            )
+
+            if not qualified:
+                st.info(f"No applications with fit score above {FIT_SCORE_THRESHOLD} yet. Run Global Match to generate more.")
+            
+            for app in qualified:
                 job_info = job_map.get(app['job_id'], {})
                 title = job_info.get("title", "Unknown Role")
                 company = job_info.get("company", "Unknown Company")
