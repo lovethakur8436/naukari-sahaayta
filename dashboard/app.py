@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import json
 import pandas as pd
+import time
 
 API_URL = "http://localhost:8000"
 
@@ -163,14 +164,61 @@ Bachelor of Technology, Computer Science Engineering 2018 – 2022""")
                 st.caption(f"Companies scraped: {', '.join(data.get('companies_scraped', []))}")
             else:
                 st.error(f"Error {res.status_code}: {data.get('detail', str(data))}")
-        
-    if st.button("Trigger Global Match"):
-        with st.spinner("Matching in progress (processing 5 jobs)..."):
-            res = requests.post(f"{API_URL}/applications/match", json={"base_resume": base_resume_text})
+
+    st.subheader("Match Jobs")
+    batch_size = st.slider(
+        "Batch size (jobs per cycle)", min_value=5, max_value=50, value=10, step=5,
+        help="Higher = faster but each Groq call takes longer"
+    )
+    delay_secs = st.slider(
+        "Delay between batches (seconds)", min_value=1, max_value=30, value=5, step=1,
+        help="Pause between batches to avoid Groq rate limiting"
+    )
+
+    col_m1, col_m2 = st.columns(2)
+    with col_m1:
+        if st.button("Match Next Batch", help="Process one batch only"):
+            with st.spinner(f"Matching {batch_size} jobs..."):
+                res = requests.post(
+                    f"{API_URL}/applications/match",
+                    json={"base_resume": base_resume_text, "batch_size": batch_size}
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    st.success(data["message"])
+                    st.caption(f"Remaining unmatched: {data.get('remaining_unmatched', '?')}")
+                else:
+                    st.error(f"Error: {res.text}")
+
+    with col_m2:
+        if st.button("▶▶ Match ALL in Background", help="Runs in background — UI stays free"):
+            res = requests.post(
+                f"{API_URL}/applications/match-all",
+                json={"base_resume": base_resume_text, "batch_size": batch_size, "delay": delay_secs}
+            )
             if res.status_code == 200:
-                st.success(res.json()["message"])
+                st.success("Match-all started in background! Switch to any tab — UI is free.")
             else:
-                st.error(f"Error matching: {res.text}")
+                st.error(f"Error: {res.text}")
+
+    # Live status widget — always visible in Setup tab
+    st.divider()
+    st.subheader("Match-All Status")
+    status_placeholder = st.empty()
+    try:
+        status = requests.get(f"{API_URL}/applications/match-all/status", timeout=2).json()
+        if status["running"]:
+            total = status["total"] or 1
+            progress = min(status["matched"] / total, 1.0)
+            status_placeholder.progress(progress, text=f"⏳ {status['message']}")
+            if st.button("Refresh Status"):
+                st.rerun()
+        elif status["message"] == "idle":
+            status_placeholder.caption("No match-all running.")
+        else:
+            status_placeholder.success(f"✅ {status['message']}")
+    except Exception:
+        status_placeholder.caption("API not reachable or no match-all run yet.")
 
 with tab1:
     st.header("Ingested Jobs")
@@ -189,73 +237,70 @@ with tab2:
     st.header("Application Queue")
 
     FIT_SCORE_THRESHOLD = 60
-    
+
     if st.button("Refresh Applications"):
         st.rerun()
-        
+
     try:
         apps = requests.get(f"{API_URL}/applications").json()
         jobs_req = requests.get(f"{API_URL}/jobs", params={"limit": 1000}).json()
         job_map = {j["id"]: j for j in jobs_req} if jobs_req else {}
-        
+
         if apps:
             qualified = [a for a in apps if (a.get("fit_score") or 0) > FIT_SCORE_THRESHOLD]
             hidden_count = len(apps) - len(qualified)
-
             st.caption(
                 f"Showing **{len(qualified)}** applications with fit score > {FIT_SCORE_THRESHOLD}"
                 + (f" · {hidden_count} low-score apps hidden" if hidden_count > 0 else "")
             )
 
             if not qualified:
-                st.info(f"No applications with fit score above {FIT_SCORE_THRESHOLD} yet. Run Global Match to generate more.")
-            
+                st.info(f"No applications with fit score above {FIT_SCORE_THRESHOLD} yet. Run Match All in Setup tab.")
+
             for app in qualified:
                 job_info = job_map.get(app['job_id'], {})
                 title = job_info.get("title", "Unknown Role")
                 company = job_info.get("company", "Unknown Company")
                 location = job_info.get("location", "Unknown Location")
-                
+
                 with st.expander(f"App #{app['id']} | {company} - {title} | {location} | Fit: {app['fit_score']}"):
                     st.write(f"**Role Details:** {title} @ {company} ({location})")
-                    
+
                     status_color = "blue"
                     if app['status'] == 'AUTO_APPLIED': status_color = "green"
                     elif app['status'] == 'FAILED': status_color = "red"
                     st.markdown(f"**Status:** :{status_color}[{app['status']}]")
-                    
+
                     full_analysis = app.get('fit_analysis', '')
                     short_analysis = full_analysis.split('\n')[0] if full_analysis else ""
                     if len(short_analysis) > 120:
                         short_analysis = short_analysis[:117] + "..."
-                        
                     st.write(f"**Fit Analysis:** {short_analysis}")
-                    
+
                     colA, colB = st.columns(2)
                     with colA:
                         if st.button(f"Tailor Resume #{app['id']}"):
-                            res = requests.post(f"{API_URL}/applications/{app['id']}/tailor", json=json.loads(base_resume_json))
+                            res = requests.post(
+                                f"{API_URL}/applications/{app['id']}/tailor",
+                                json=json.loads(base_resume_json)
+                            )
                             st.success("Tailored!")
                     with colB:
                         if st.button(f"Auto-Apply #{app['id']}"):
                             profile = {
-                                "first_name": first_name,
-                                "last_name": last_name,
-                                "email": email,
-                                "phone": phone,
-                                "linkedin": linkedin_url,
-                                "github": github_url,
-                                "portfolio": portfolio_url,
-                                "location": location_input,
-                                "work_auth": work_auth,
-                                "gender": gender,
-                                "hispanic": hispanic,
-                                "veteran": veteran,
+                                "first_name": first_name, "last_name": last_name,
+                                "email": email, "phone": phone,
+                                "linkedin": linkedin_url, "github": github_url,
+                                "portfolio": portfolio_url, "location": location_input,
+                                "work_auth": work_auth, "gender": gender,
+                                "hispanic": hispanic, "veteran": veteran,
                                 "disability": disability
                             }
-                            res = requests.post(f"{API_URL}/applications/{app['id']}/apply", json=profile)
-                            st.success("Apply process started! Wait a few seconds and click 'Refresh Applications' above.")
-                            
+                            res = requests.post(
+                                f"{API_URL}/applications/{app['id']}/apply", json=profile
+                            )
+                            st.success("Apply process started! Refresh in a few seconds.")
+
                     if app.get('submission_log_json_path'):
                         try:
                             with open(app['submission_log_json_path'], 'r') as f:
