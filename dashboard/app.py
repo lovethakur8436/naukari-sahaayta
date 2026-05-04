@@ -13,7 +13,7 @@ tab1, tab2, tab3 = st.tabs(["Jobs", "Applications", "Candidate Profile & Setup"]
 
 with tab3:
     st.header("Candidate Profile Setup")
-    
+
     col1, col2, col3 = st.columns(3)
     with col1:
         st.subheader("Basic Info")
@@ -21,13 +21,13 @@ with tab3:
         last_name = st.text_input("Last Name", "Kumar")
         email = st.text_input("Email", "luvkumar8436@gmail.com")
         phone = st.text_input("Phone", "+91-7689961477")
-        
+
     with col2:
         st.subheader("Links")
         linkedin_url = st.text_input("LinkedIn", "linkedin.com/in/luv-kumar-06975b175")
         github_url = st.text_input("GitHub", "https://github.com/lovethakur8436")
         portfolio_url = st.text_input("Portfolio / Website", "")
-        
+
     with col3:
         st.subheader("Demographics & Status")
         location_input = st.text_input("Current Location", "Hyderabad, India")
@@ -36,7 +36,7 @@ with tab3:
         hispanic = st.selectbox("Hispanic/Latino", ["Yes", "No", "Decline to self-identify"], index=1)
         veteran = st.selectbox("Veteran Status", ["I am not a protected veteran", "Decline to self-identify"], index=0)
         disability = st.selectbox("Disability Status", ["No, I don't have a disability", "Decline to self-identify"], index=0)
-        
+
     st.subheader("Base Resume Configurations")
     colA, colB = st.columns(2)
     with colA:
@@ -81,7 +81,7 @@ InfraBoard — Ansible Ops Dashboard | Python, FastAPI, React.js, MongoDB, Docke
 Education
 Dr. A.P.J. Abdul Kalam Technical University Lucknow, India
 Bachelor of Technology, Computer Science Engineering 2018 – 2022""")
-        
+
     base_resume_json = st.text_area("Base Resume JSON (For Tailoring)", height=300, value='''{
   "personal": {"name": "Luv Kumar", "phone": "+91-7689961477", "email": "luvkumar8436@gmail.com", "linkedin": "linkedin.com/in/luv-kumar-06975b175", "github": "github.com/lovethakur8436"},
   "summary": "Java Software Engineer with 3.5+ years at Wells Fargo designing and maintaining Spring Boot microservices for high-volume financial transaction processing. Experienced in REST API development, Hibernate/Spring Data JPA, OAuth2/JWT security, and cloud-native deployments on AWS.",
@@ -191,34 +191,34 @@ Bachelor of Technology, Computer Science Engineering 2018 – 2022""")
                     st.error(f"Error: {res.text}")
 
     with col_m2:
-        if st.button("▶▶ Match ALL in Background", help="Runs in background — UI stays free"):
+        if st.button("▶▶ Match ALL in Background", help="Runs in backend — UI stays free"):
             res = requests.post(
                 f"{API_URL}/applications/match-all",
                 json={"base_resume": base_resume_text, "batch_size": batch_size, "delay": delay_secs}
             )
             if res.status_code == 200:
-                st.success("Match-all started in background! Switch to any tab — UI is free.")
+                st.success("✅ Match-all started! Switch tabs freely — matching runs in background.")
             else:
                 st.error(f"Error: {res.text}")
 
-    # Live status widget — always visible in Setup tab
     st.divider()
     st.subheader("Match-All Status")
-    status_placeholder = st.empty()
+    match_status_placeholder = st.empty()
     try:
-        status = requests.get(f"{API_URL}/applications/match-all/status", timeout=2).json()
-        if status["running"]:
-            total = status["total"] or 1
-            progress = min(status["matched"] / total, 1.0)
-            status_placeholder.progress(progress, text=f"⏳ {status['message']}")
-            if st.button("Refresh Status"):
+        mstatus = requests.get(f"{API_URL}/applications/match-all/status", timeout=2).json()
+        if mstatus["running"]:
+            total = mstatus["total"] or 1
+            progress = min(mstatus["matched"] / total, 1.0)
+            match_status_placeholder.progress(progress, text=f"⏳ {mstatus['message']}")
+            if st.button("Refresh Match Status"):
                 st.rerun()
-        elif status["message"] == "idle":
-            status_placeholder.caption("No match-all running.")
+        elif mstatus["message"] == "idle":
+            match_status_placeholder.caption("No match-all running.")
         else:
-            status_placeholder.success(f"✅ {status['message']}")
+            match_status_placeholder.success(f"✅ {mstatus['message']}")
     except Exception:
-        status_placeholder.caption("API not reachable or no match-all run yet.")
+        match_status_placeholder.caption("API not reachable or no match-all run yet.")
+
 
 with tab1:
     st.header("Ingested Jobs")
@@ -233,14 +233,79 @@ with tab1:
     except Exception as e:
         st.error(f"Failed to connect to API: {e}")
 
+
 with tab2:
     st.header("Application Queue")
 
-    FIT_SCORE_THRESHOLD = 60
+    # --- Auto-Process All controls ---
+    st.subheader("Bulk Automation")
+    proc_col1, proc_col2, proc_col3 = st.columns([2, 1, 1])
+    with proc_col1:
+        fit_threshold = st.slider(
+            "Min fit score to process", min_value=0, max_value=100, value=60, step=5,
+            help="Only tailor + apply apps above this score"
+        )
+    with proc_col2:
+        proc_delay = st.slider(
+            "Delay between apps (s)", min_value=2, max_value=30, value=5, step=1,
+            help="Pause between each tailor+apply cycle"
+        )
+    with proc_col3:
+        st.write("")
+        st.write("")
+        if st.button("▶▶ Auto-Process All", help="Tailor + Apply all qualifying apps in background"):
+            profile = {
+                "first_name": first_name, "last_name": last_name,
+                "email": email, "phone": phone,
+                "linkedin": linkedin_url, "github": github_url,
+                "portfolio": portfolio_url, "location": location_input,
+                "work_auth": work_auth, "gender": gender,
+                "hispanic": hispanic, "veteran": veteran,
+                "disability": disability
+            }
+            try:
+                res = requests.post(
+                    f"{API_URL}/applications/process-all",
+                    json={
+                        "base_resume_json": json.loads(base_resume_json),
+                        "candidate_profile": profile,
+                        "fit_threshold": float(fit_threshold),
+                        "delay": proc_delay
+                    }
+                )
+                if res.status_code == 200:
+                    st.success("✅ Auto-process started! You can freely use the dashboard.")
+                else:
+                    st.error(f"Error: {res.text}")
+            except json.JSONDecodeError:
+                st.error("Base Resume JSON is invalid. Fix it in the Setup tab.")
+
+    # --- Process-All Status widget ---
+    proc_status_placeholder = st.empty()
+    try:
+        pstatus = requests.get(f"{API_URL}/applications/process-all/status", timeout=2).json()
+        if pstatus["running"]:
+            total = pstatus["total"] or 1
+            progress = min(pstatus["processed"] / total, 1.0)
+            label = f"⏳ {pstatus['message']}"
+            if pstatus.get("current_job"):
+                label += f" — {pstatus['current_job']}"
+            proc_status_placeholder.progress(progress, text=label)
+        elif pstatus["message"] == "idle":
+            proc_status_placeholder.caption("")
+        else:
+            color = "success" if pstatus["failed"] == 0 else "warning"
+            getattr(proc_status_placeholder, color)(f"✅ {pstatus['message']}")
+    except Exception:
+        pass
 
     if st.button("Refresh Applications"):
         st.rerun()
 
+    st.divider()
+
+    # --- Application list ---
+    FIT_SCORE_THRESHOLD = 60
     try:
         apps = requests.get(f"{API_URL}/applications").json()
         jobs_req = requests.get(f"{API_URL}/jobs", params={"limit": 1000}).json()
@@ -267,8 +332,9 @@ with tab2:
                     st.write(f"**Role Details:** {title} @ {company} ({location})")
 
                     status_color = "blue"
-                    if app['status'] == 'AUTO_APPLIED': status_color = "green"
+                    if app['status'] in ('AUTO_APPLIED', 'APPLIED'): status_color = "green"
                     elif app['status'] == 'FAILED': status_color = "red"
+                    elif app['status'] == 'TAILORED': status_color = "orange"
                     st.markdown(f"**Status:** :{status_color}[{app['status']}]")
 
                     full_analysis = app.get('fit_analysis', '')
@@ -299,7 +365,7 @@ with tab2:
                             res = requests.post(
                                 f"{API_URL}/applications/{app['id']}/apply", json=profile
                             )
-                            st.success("Apply process started! Refresh in a few seconds.")
+                            st.success("Apply started! Refresh in a few seconds.")
 
                     if app.get('submission_log_json_path'):
                         try:

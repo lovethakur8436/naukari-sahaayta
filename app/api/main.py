@@ -18,8 +18,11 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Naukari Sahaayta — Job Application Automation API")
 
+MAX_RETRIES = 5
+RETRY_BASE_DELAY = 30  # seconds; doubles each attempt: 30, 60, 120, 240, 480
+
 # ------------------------------------------------------------------ #
-# In-memory match-all state (single worker process)                   #
+# In-memory state                                                      #
 # ------------------------------------------------------------------ #
 
 match_status = {
@@ -27,8 +30,45 @@ match_status = {
     "matched": 0,
     "remaining": 0,
     "total": 0,
+    "skipped": 0,
     "message": "idle"
 }
+
+process_status = {
+    "running": False,
+    "processed": 0,
+    "failed": 0,
+    "remaining": 0,
+    "total": 0,
+    "current_job": "",
+    "message": "idle"
+}
+
+
+# ------------------------------------------------------------------ #
+# Background workers                                                   #
+# ------------------------------------------------------------------ #
+
+def _match_job_with_retry(db, job, base_resume):
+    """Call match_job with exponential backoff on rate-limit errors."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            match_job(db, job, base_resume)
+            return True
+        except Exception as e:
+            err = str(e).lower()
+            if "429" in err or "rate limit" in err or "rate_limit" in err:
+                wait = RETRY_BASE_DELAY * (2 ** attempt)
+                match_status["message"] = (
+                    f"Rate limited — waiting {wait}s (attempt {attempt + 1}/{MAX_RETRIES})..."
+                )
+                print(f"[match-all] Rate limited on job {job.id}. Waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"[match-all] Non-retryable error on job {job.id}: {e}")
+                return False
+    print(f"[match-all] Exhausted retries for job {job.id}. Skipping.")
+    return False
 
 
 def _run_match_all(base_resume: str, batch_size: int, delay: int):
@@ -36,11 +76,8 @@ def _run_match_all(base_resume: str, batch_size: int, delay: int):
     global match_status
     db = SessionLocal()
     try:
-        match_status["running"] = True
-        match_status["matched"] = 0
-        match_status["message"] = "starting"
+        match_status.update({"running": True, "matched": 0, "skipped": 0, "message": "starting"})
 
-        # Count total unmatched upfront
         total = (
             db.query(JobPosting)
             .outerjoin(Application)
@@ -63,19 +100,124 @@ def _run_match_all(base_resume: str, batch_size: int, delay: int):
 
             for job in unmatched:
                 print(f"[match-all] Matching job {job.id}: {job.title} at {job.company}")
-                match_job(db, job, base_resume)
-                match_status["matched"] += 1
+                match_status["message"] = f"Matching: {job.title} @ {job.company}"
+                success = _match_job_with_retry(db, job, base_resume)
+                if success:
+                    match_status["matched"] += 1
+                else:
+                    match_status["skipped"] += 1
                 match_status["remaining"] = max(0, match_status["remaining"] - 1)
-                match_status["message"] = f"Matched {match_status['matched']} / {match_status['total']}"
+                match_status["message"] = (
+                    f"Matched {match_status['matched']} / {match_status['total']}"
+                    f" ({match_status['skipped']} skipped)"
+                )
 
             time.sleep(delay)
 
         match_status["running"] = False
-        match_status["message"] = f"Done! Matched {match_status['matched']} jobs."
+        match_status["message"] = (
+            f"Done! Matched {match_status['matched']} jobs"
+            + (f", {match_status['skipped']} skipped" if match_status['skipped'] else ".")
+        )
     except Exception as e:
         match_status["running"] = False
         match_status["message"] = f"Error: {str(e)}"
         print(f"[match-all] Error: {e}")
+    finally:
+        db.close()
+
+
+def _run_process_all(
+    base_resume_json: dict,
+    candidate_profile: dict,
+    fit_threshold: float,
+    delay: int
+):
+    """Background task: tailor then apply every qualifying unprocessed application."""
+    global process_status
+    db = SessionLocal()
+    try:
+        process_status.update({
+            "running": True, "processed": 0, "failed": 0,
+            "current_job": "", "message": "starting"
+        })
+
+        # Fetch all qualifying apps not yet applied
+        apps = (
+            db.query(Application)
+            .join(JobPosting, Application.job_id == JobPosting.id)
+            .filter(
+                Application.fit_score >= fit_threshold,
+                Application.status.notin_(["AUTO_APPLIED", "APPLIED", "FAILED"])
+            )
+            .order_by(Application.fit_score.desc())
+            .all()
+        )
+
+        process_status["total"] = len(apps)
+        process_status["remaining"] = len(apps)
+
+        for app_entry in apps:
+            job = db.query(JobPosting).filter(JobPosting.id == app_entry.job_id).first()
+            job_label = f"{job.title} @ {job.company}" if job else f"App #{app_entry.id}"
+
+            # --- Step 1: Tailor (skip if already tailored) ---
+            if app_entry.status != "TAILORED":
+                try:
+                    process_status["current_job"] = f"Tailoring: {job_label}"
+                    process_status["message"] = process_status["current_job"]
+                    print(f"[process-all] Tailoring {job_label}")
+                    generate_tailored_resume(db, app_entry, base_resume_json)
+                except Exception as e:
+                    err = str(e).lower()
+                    if "429" in err or "rate limit" in err or "rate_limit" in err:
+                        wait = RETRY_BASE_DELAY
+                        process_status["message"] = f"Rate limited during tailor — waiting {wait}s..."
+                        print(f"[process-all] Rate limited tailoring {job_label}. Waiting {wait}s.")
+                        time.sleep(wait)
+                        try:
+                            generate_tailored_resume(db, app_entry, base_resume_json)
+                        except Exception as e2:
+                            print(f"[process-all] Tailor retry failed for {job_label}: {e2}")
+                            process_status["failed"] += 1
+                            process_status["remaining"] -= 1
+                            continue
+                    else:
+                        print(f"[process-all] Tailor error for {job_label}: {e}")
+                        process_status["failed"] += 1
+                        process_status["remaining"] -= 1
+                        continue
+
+            # --- Step 2: Apply ---
+            try:
+                process_status["current_job"] = f"Applying: {job_label}"
+                process_status["message"] = process_status["current_job"]
+                print(f"[process-all] Applying {job_label}")
+                # process_application is synchronous Playwright — run inline
+                process_application(db, app_entry, candidate_profile)
+                process_status["processed"] += 1
+            except Exception as e:
+                print(f"[process-all] Apply error for {job_label}: {e}")
+                process_status["failed"] += 1
+
+            process_status["remaining"] = max(0, process_status["remaining"] - 1)
+            process_status["message"] = (
+                f"Processed {process_status['processed']} / {process_status['total']}"
+                f" ({process_status['failed']} failed)"
+            )
+            time.sleep(delay)
+
+        process_status["running"] = False
+        process_status["current_job"] = ""
+        process_status["message"] = (
+            f"Done! Applied to {process_status['processed']} jobs"
+            + (f", {process_status['failed']} failed" if process_status['failed'] else ".")
+        )
+    except Exception as e:
+        process_status["running"] = False
+        process_status["current_job"] = ""
+        process_status["message"] = f"Error: {str(e)}"
+        print(f"[process-all] Fatal error: {e}")
     finally:
         db.close()
 
@@ -91,7 +233,13 @@ class MatchRequest(BaseModel):
 class MatchAllRequest(BaseModel):
     base_resume: str
     batch_size: int = 10
-    delay: int = 3
+    delay: int = 5
+
+class ProcessAllRequest(BaseModel):
+    base_resume_json: dict
+    candidate_profile: dict
+    fit_threshold: float = 60.0
+    delay: int = 5
 
 class IngestRequest(BaseModel):
     greenhouse: Optional[List[str]] = []
@@ -124,10 +272,7 @@ def trigger_ingest(req: IngestRequest, db: Session = Depends(get_db)):
     lever_tokens = req.lever or []
     if not greenhouse_tokens and not lever_tokens:
         greenhouse_tokens = ["gitlab"]
-    ingestors = build_ingestors(
-        greenhouse_tokens=greenhouse_tokens,
-        lever_tokens=lever_tokens
-    )
+    ingestors = build_ingestors(greenhouse_tokens=greenhouse_tokens, lever_tokens=lever_tokens)
     added = ingest_jobs(db, ingestors)
     return {
         "message": f"Successfully ingested {added} new jobs",
@@ -141,7 +286,7 @@ def trigger_ingest(req: IngestRequest, db: Session = Depends(get_db)):
 
 @app.post("/applications/match")
 def trigger_match(req: MatchRequest, db: Session = Depends(get_db)):
-    """Single batch match (5 jobs by default). UI-safe, returns remaining count."""
+    """Single batch match. Returns remaining count."""
     batch_size = max(1, min(req.batch_size, 50))
     unmatched = (
         db.query(JobPosting)
@@ -150,12 +295,12 @@ def trigger_match(req: MatchRequest, db: Session = Depends(get_db)):
         .all()
     )
     total_remaining = len(unmatched)
-    to_process = unmatched[:batch_size]
     matched_count = 0
-    for job in to_process:
+    for job in unmatched[:batch_size]:
         print(f"Matching job {job.id}: {job.title} at {job.company}...")
-        match_job(db, job, req.base_resume)
-        matched_count += 1
+        success = _match_job_with_retry(db, job, req.base_resume)
+        if success:
+            matched_count += 1
     return {
         "message": f"Matched {matched_count} jobs",
         "matched_count": matched_count,
@@ -165,7 +310,7 @@ def trigger_match(req: MatchRequest, db: Session = Depends(get_db)):
 
 @app.post("/applications/match-all")
 def trigger_match_all(req: MatchAllRequest, background_tasks: BackgroundTasks):
-    """Start background match-all loop. Returns immediately so UI stays free."""
+    """Start background match-all loop. Returns immediately."""
     global match_status
     if match_status["running"]:
         return {"message": "Match-all already running", "status": match_status}
@@ -177,8 +322,29 @@ def trigger_match_all(req: MatchAllRequest, background_tasks: BackgroundTasks):
 
 @app.get("/applications/match-all/status")
 def get_match_all_status():
-    """Poll this to get live progress of the background match-all task."""
     return match_status
+
+
+@app.post("/applications/process-all")
+def trigger_process_all(req: ProcessAllRequest, background_tasks: BackgroundTasks):
+    """Start background tailor+apply loop for all qualifying apps. Returns immediately."""
+    global process_status
+    if process_status["running"]:
+        return {"message": "Process-all already running", "status": process_status}
+    delay = max(1, min(req.delay, 60))
+    background_tasks.add_task(
+        _run_process_all,
+        req.base_resume_json,
+        req.candidate_profile,
+        req.fit_threshold,
+        delay
+    )
+    return {"message": "Process-all started in background", "status": process_status}
+
+
+@app.get("/applications/process-all/status")
+def get_process_all_status():
+    return process_status
 
 
 # ------------------------------------------------------------------ #
@@ -207,7 +373,7 @@ def read_applications(
 
 
 # ------------------------------------------------------------------ #
-# Tailor & Apply                                                       #
+# Tailor & Apply (individual)                                          #
 # ------------------------------------------------------------------ #
 
 @app.post("/applications/{app_id}/tailor")
