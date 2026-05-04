@@ -50,30 +50,50 @@ def generate_tailored_resume(db: Session, application: Application, base_resume_
     with open('app/tailor/template.tex', 'r') as f:
         latex_template = f.read()
 
-    prompt = f"""
-You are an expert resume writer following the strict guidelines from techinterviewhandbook.org/resume/.
-Tailor the base resume data to BEST fit the job description below.
+    prompt = f"""You are an expert ATS-focused resume writer. Your task is to tailor the candidate's resume
+for the specific job below. The output must be a SINGLE-PAGE LaTeX resume — this is non-negotiable.
 
-CRITICAL GUIDELINES:
-1. ONE PAGE STRICTLY & WELL-BALANCED: The resume MUST fill exactly one page. Provide enough bullets and detail to avoid whitespace, but do not exceed one page.
-2. ENHANCE AND EXTRAPOLATE (Realistic Enhancements): Realistically enhance the candidate's experience by adding skills, projects, or stories required by the JD. You can strengthen the story as long as it stays justifiable in an interview.
-3. HEADLINE/SUMMARY: Include a strong, targeted headline/summary at the top indicating the target role.
-4. STRONG BACKEND SIGNALS: Bullets MUST mention: testing, design patterns, API performance optimization, complex DB queries, schema design, security, and production debugging.
-5. ELEVATE PROJECTS: Rewrite projects as strong, production-grade backend case studies. Remove 'In Progress' or 'Hackathon' labels.
-6. FOCUSED SKILLS: Group and filter skills to establish a strong backend identity.
-7. Use STAR method for all bullets. Start with a strong action verb and quantify achievements.
-8. Output VALID LaTeX code using the provided template structure.
-9. Escape special LaTeX characters (%, &, $, #, _).
-10. DO NOT use any markdown code blocks. Output raw LaTeX only.
+=== STRICT ONE-PAGE RULES (LaTeX layout) ===
+- Add \\usepackage[top=0.4in, bottom=0.4in, left=0.5in, right=0.5in]{{geometry}} in the preamble
+- Use \\setlength{{\\itemsep}}{{0pt}} and \\setlength{{\\parskip}}{{0pt}} on every itemize/enumerate
+- Maximum 5 bullets for the primary job (Wells Fargo)
+- Maximum 1 bullet for the internship role
+- Maximum 2 bullets per project
+- Maximum 4 skill category rows, each row under 80 characters total
+- Summary: 2 sentences max
+- If content still risks overflowing, shorten bullet text — NEVER let content go to page 2
 
+=== SUMMARY RULES ===
+- The summary opening title MUST be "Software Engineer" or "Backend Engineer"
+- NEVER use the job's title verbatim (e.g. do NOT write "Customer Success Engineer" or "Solutions Architect")
+- Good example: "Backend Engineer with 3.5+ years at Wells Fargo..."
+- Bad example: "Customer Success Engineer with 3.5+ years..."
+
+=== BULLET QUALITY RULES ===
+- Every bullet must be UNIQUE — never repeat the same sentence structure or phrasing across bullets
+- Every bullet must follow STAR format: Strong action verb → What you built/did → Technology used → Quantified result
+- Do NOT use generic filler phrases like "Utilized design patterns such as Singleton and Factory" unless the JD specifically requires it
+- Tailor bullets to naturally match the JD's keywords — do not force irrelevant technologies
+- Remove "In Progress" and "Hackathon" labels from projects — present all projects as completed production work
+
+=== SKILLS SECTION RULES ===
+- Include ONLY skills directly relevant to this specific JD
+- Maximum 4 categories
+- Each category line must fit within 80 characters (including the category label)
+- Remove entire categories that have zero relevance to the JD
+
+=== JOB TO TAILOR FOR ===
 Job Title: {job.title}
-Job Description: {job.description[:2000]}
+Job Description:
+{job.description[:2500]}
 
-Base Resume JSON:
+=== BASE RESUME DATA ===
 {json.dumps(base_resume_data)}
 
-LaTeX Template:
+=== LATEX TEMPLATE ===
 {latex_template}
+
+Output ONLY raw valid LaTeX. No markdown, no code fences, no explanation.
 """
 
     try:
@@ -127,13 +147,15 @@ def validate_resume(application: Application, tailored_tex: str):
     """
     Validate the tailored resume against ATS-safe and FAANG guidelines using Groq.
     """
-    validation_prompt = f"""
-Review the following tailored resume LaTeX and validate it against these TechInterviewHandbook guidelines:
-1. Strictly one page, well-balanced (~400-500 words), no excessive whitespace.
-2. Strong backend signals (testing, DB schema, performance, APIs).
-3. Uses STAR method and action verbs, quantified achievements.
-4. Projects sound like production-grade backend case studies.
-5. Content is realistically enhanced for a mid-level backend engineer.
+    validation_prompt = f"""Review the following tailored resume LaTeX and validate it against these guidelines:
+1. Strictly one page — no content overflow to page 2.
+2. Summary uses "Software Engineer" or "Backend Engineer" as the title, NOT the job title verbatim.
+3. Wells Fargo has max 5 bullets, internship has max 1 bullet, each project has max 2 bullets.
+4. Every bullet is unique — no repeated sentence patterns.
+5. Strong backend signals: testing, DB schema, API performance, security, production debugging.
+6. Uses STAR method and strong action verbs with quantified achievements.
+7. Skills section has max 4 categories, each under 80 characters.
+8. Projects presented as completed production work (no "In Progress" or "Hackathon" labels).
 
 Resume LaTeX:
 {tailored_tex[:6000]}
