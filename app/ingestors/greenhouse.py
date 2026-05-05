@@ -24,6 +24,24 @@ def _get_company_name(board_token: str) -> str:
     return board_token.title()
 
 
+def _greenhouse_apply_url(board_token: str, job_id) -> str:
+    """
+    Build the canonical Greenhouse apply URL using the board token + job ID.
+
+    WHY: The `absolute_url` returned by the Greenhouse API often points to a
+    company's CUSTOM careers page (e.g. stripe.com/jobs/search?gh_jid=XXX).
+    When a job closes, those custom pages redirect to a listing/search page,
+    which the apply agent mistakenly treats as a dead-job redirect.
+
+    The boards.greenhouse.io URL is always stable, goes directly to the apply
+    form, and does NOT redirect when the job is still open.
+
+    Format: https://boards.greenhouse.io/{board_token}/jobs/{job_id}
+    Example: https://boards.greenhouse.io/stripe/jobs/7292520
+    """
+    return f"https://boards.greenhouse.io/{board_token}/jobs/{job_id}"
+
+
 class GreenhouseIngestor(BaseIngestor):
     portal_name = "Greenhouse"
 
@@ -38,7 +56,7 @@ class GreenhouseIngestor(BaseIngestor):
             response.raise_for_status()
             raw_jobs = response.json().get("jobs", [])
 
-            # Greenhouse: location lives inside nested dict; flatten for the filter
+            # Flatten location for filter module
             for job in raw_jobs:
                 if isinstance(job.get("location"), dict):
                     job["_location_str"] = job["location"].get("name", "")
@@ -49,7 +67,7 @@ class GreenhouseIngestor(BaseIngestor):
                 raw_jobs,
                 company=self.company_name,
                 title_key="title",
-                description_key="content",   # Greenhouse uses 'content' for description
+                description_key="content",
                 location_key="_location_str",
             )
             return filtered
@@ -64,13 +82,20 @@ class GreenhouseIngestor(BaseIngestor):
         if isinstance(location, dict):
             location = location.get("name", "")
 
+        job_id = raw_job.get("id")
+
+        # Always use the canonical boards.greenhouse.io apply URL.
+        # Avoids false "dead job" detections caused by company custom career
+        # pages (e.g. stripe.com/jobs/search?gh_jid=...) redirecting on close.
+        apply_url = _greenhouse_apply_url(self.board_token, job_id)
+
         return JobPostingCreate(
             portal=self.portal_name,
-            portal_job_id=str(raw_job.get("id")),
+            portal_job_id=str(job_id),
             title=raw_job.get("title", "Unknown"),
             company=self.company_name,
             location=location,
             description=clean_desc.strip()[:2000],
-            url=raw_job.get("absolute_url", ""),
+            url=apply_url,
             raw_data=raw_job
         )
