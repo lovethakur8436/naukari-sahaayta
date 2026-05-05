@@ -6,12 +6,17 @@ import os
 import re
 from groq import Groq
 
+# Max options to send to the LLM. Country/state lists can be 200+ items — we
+# auto-resolve those from the candidate profile BEFORE calling the LLM so they
+# never inflate the token count.
+_MAX_OPTIONS_FOR_LLM = 40
+
 
 def _get_react_select_options(page, field_id: str) -> list[str]:
     """
     Open a React Select dropdown, collect ALL visible option texts, then close it.
     Returns a list of exact option strings as the user would see them.
-    This must be called BEFORE Groq so we send real options to the LLM.
+    This must be called BEFORE the LLM so we send real options.
     """
     control_div = page.locator(
         f"xpath=//input[@id='{field_id}']/ancestor::div[contains(@class,'select__control')]"
@@ -40,7 +45,7 @@ def _get_react_select_options(page, field_id: str) -> list[str]:
 
 def _get_react_select_options_typeahead(page, field_id: str, search_term: str) -> list[str]:
     """
-    FIX #2 — Typeahead react-select support.
+    Typeahead react-select support.
     For fields that show no options until something is typed (e.g. candidate-location),
     type the search_term first, wait for options to appear, then collect them.
     """
@@ -51,7 +56,7 @@ def _get_react_select_options_typeahead(page, field_id: str, search_term: str) -
     try:
         control_div.click(timeout=4000)
         page.wait_for_timeout(300)
-        input_el.type(search_term[:10], delay=60)   # type up to 10 chars to trigger results
+        input_el.type(search_term[:10], delay=60)
         page.wait_for_timeout(800)
     except Exception:
         page.keyboard.press("Escape")
@@ -80,16 +85,12 @@ def _fill_react_select(page, field_id: str, answer_text: str, logs: list) -> boo
       2. Type a SHORT search term (first word only) to filter the list
       3. Find the option whose text EXACTLY matches answer_text
       4. Click it
-
-    NOTE: answer_text must be the EXACT option string from the dropdown
-    (collected by _get_react_select_options before calling Groq).
     """
     control_div = page.locator(
         f"xpath=//input[@id='{field_id}']/ancestor::div[contains(@class,'select__control')]"
     )
     input_el = page.locator(f"input#{field_id}")
 
-    # Step 1 - open
     try:
         control_div.click(timeout=4000)
         page.wait_for_timeout(300)
@@ -97,7 +98,6 @@ def _fill_react_select(page, field_id: str, answer_text: str, logs: list) -> boo
         logs.append(f"react-select open failed for {field_id}: {e}")
         return False
 
-    # Step 2 - type only the first word to filter
     first_word = answer_text.split()[0] if answer_text else answer_text
     try:
         input_el.type(first_word, delay=50)
@@ -105,7 +105,6 @@ def _fill_react_select(page, field_id: str, answer_text: str, logs: list) -> boo
     except Exception as e:
         logs.append(f"react-select type failed for {field_id}: {e}")
 
-    # Step 3 - collect filtered options
     listbox = page.locator(f"[id='react-select-{field_id}-listbox'], div[role='listbox']").first
     try:
         listbox.wait_for(state="visible", timeout=4000)
@@ -132,37 +131,31 @@ def _fill_react_select(page, field_id: str, answer_text: str, logs: list) -> boo
 
     logs.append(f"react-select: {count} options for {field_id}, want '{answer_text}': {option_texts}")
 
-    # Match priority: exact -> case-insensitive -> startswith -> contains
     matched_idx = None
     for i, t in enumerate(option_texts):
         if t == answer_text:
-            matched_idx = i
-            break
+            matched_idx = i; break
     if matched_idx is None:
         for i, t in enumerate(option_texts):
             if t.lower() == answer_text.lower():
                 matched_idx = i
-                logs.append(f"react-select: case-matched -> '{t}'")
-                break
+                logs.append(f"react-select: case-matched -> '{t}'"); break
     if matched_idx is None:
         for i, t in enumerate(option_texts):
             if t.lower().startswith(answer_text.lower()):
                 matched_idx = i
-                logs.append(f"react-select: startswith-matched -> '{t}'")
-                break
+                logs.append(f"react-select: startswith-matched -> '{t}'"); break
     if matched_idx is None:
         for i, t in enumerate(option_texts):
             if answer_text.lower() in t.lower():
                 matched_idx = i
-                logs.append(f"react-select: partial-matched -> '{t}'")
-                break
+                logs.append(f"react-select: partial-matched -> '{t}'"); break
 
     if matched_idx is None:
         logs.append(f"react-select: NO MATCH for '{answer_text}' in {option_texts}")
         page.keyboard.press("Escape")
         return False
 
-    # Step 4 - click
     try:
         options.nth(matched_idx).click(timeout=3000)
         page.wait_for_timeout(400)
@@ -174,15 +167,133 @@ def _fill_react_select(page, field_id: str, answer_text: str, logs: list) -> boo
 
 
 def _clean_phone(phone: str) -> str:
-    """
-    Strip the country code prefix from a phone number.
-    Greenhouse adds the country code via the country selector,
-    so the phone input should only contain the local number.
-    e.g. '+91-7689961477' -> '7689961477'
-    """
     if not phone:
         return phone
     return re.sub(r'^\+?\d{1,3}[-\s]', '', phone.strip())
+
+
+# ------------------------------------------------------------------ #
+# Token-saver: pre-resolve large option lists from candidate profile  #
+# before sending to the LLM, so giant country/state lists never burn  #
+# 1500+ tokens per call.                                              #
+# ------------------------------------------------------------------ #
+_LARGE_LIST_PROFILE_KEYS = {
+    # label keywords -> candidate_profile key to resolve the answer from
+    "country":    "country",
+    "nation":     "country",
+    "located":    "country",
+    "citizenship": "country",
+    "nationality": "country",
+    "state":      "state",
+    "province":   "state",
+    "region":     "state",
+}
+
+def _pre_resolve_large_options(
+    field: dict,
+    candidate_profile: dict,
+    logs: list,
+) -> str | None:
+    """
+    If a react-select field has more than _MAX_OPTIONS_FOR_LLM options,
+    try to resolve the answer directly from the candidate profile without
+    sending all options to the LLM.
+
+    Returns the matched option string if resolved, else None.
+    """
+    opts = field.get("options", [])
+    if len(opts) <= _MAX_OPTIONS_FOR_LLM:
+        return None
+
+    label_lower = field.get("label", "").lower()
+    profile_key = next(
+        (v for k, v in _LARGE_LIST_PROFILE_KEYS.items() if k in label_lower),
+        None
+    )
+    if not profile_key:
+        return None
+
+    profile_val = candidate_profile.get(profile_key, "")
+    if not profile_val:
+        return None
+
+    # Find the best match in the actual options list
+    pv_lower = profile_val.lower()
+    # Exact
+    for o in opts:
+        if o.lower() == pv_lower:
+            logs.append(f"pre-resolved '{field['id']}' -> '{o}' (exact, skipping LLM)")
+            return o
+    # Startswith
+    for o in opts:
+        if o.lower().startswith(pv_lower):
+            logs.append(f"pre-resolved '{field['id']}' -> '{o}' (startswith, skipping LLM)")
+            return o
+    # Contains
+    for o in opts:
+        if pv_lower in o.lower():
+            logs.append(f"pre-resolved '{field['id']}' -> '{o}' (contains, skipping LLM)")
+            return o
+
+    return None
+
+
+def _call_llm_with_fallback(prompt: str, logs: list) -> dict:
+    """
+    Call Groq first. On rate-limit (429 / tokens exceeded), automatically
+    fall back to Gemini 1.5 Flash which has a 1M tokens/day free tier.
+    Returns parsed JSON dict of field answers.
+    """
+    # --- Groq primary ---
+    groq_key = os.getenv("GROQ_API_KEY")
+    if groq_key:
+        try:
+            client = Groq(api_key=groq_key)
+            resp = client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model="llama-3.3-70b-versatile",
+                response_format={"type": "json_object"},
+            )
+            logs.append("LLM: Groq responded OK")
+            return json.loads(resp.choices[0].message.content)
+        except Exception as groq_err:
+            err_str = str(groq_err)
+            is_rate_limit = "429" in err_str or "rate_limit_exceeded" in err_str or "tokens per day" in err_str
+            if is_rate_limit:
+                logs.append(f"Groq rate-limit hit: {err_str[:200]}. Falling back to Gemini Flash.")
+            else:
+                logs.append(f"Groq error (non-429): {err_str[:200]}. Falling back to Gemini Flash.")
+    else:
+        logs.append("GROQ_API_KEY not set. Falling back to Gemini Flash.")
+
+    # --- Gemini Flash fallback ---
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_key:
+        raise RuntimeError(
+            "Both Groq (rate-limited) and Gemini (no GEMINI_API_KEY set) are unavailable."
+        )
+
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=gemini_key)
+        model = genai.GenerativeModel(
+            model_name="gemini-1.5-flash",
+            generation_config={
+                "response_mime_type": "application/json",
+                "temperature": 0.1,
+            },
+        )
+        response = model.generate_content(prompt)
+        logs.append("LLM: Gemini Flash responded OK")
+        # Gemini returns JSON string inside response.text
+        raw = response.text.strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = re.sub(r'^```[a-z]*\n?', '', raw)
+            raw = re.sub(r'\n?```$', '', raw)
+        return json.loads(raw)
+    except Exception as gemini_err:
+        raise RuntimeError(f"Gemini Flash also failed: {gemini_err}") from gemini_err
 
 
 class GreenhouseApplyAgent(BaseApplyAgent):
@@ -192,11 +303,7 @@ class GreenhouseApplyAgent(BaseApplyAgent):
         page.goto(url)
         page.wait_for_load_state("networkidle")
 
-        # ------------------------------------------------------------------ #
-        # FIX #1 — Dead job detection                                        #
-        # If the page redirected away OR the form never appeared,            #
-        # mark as FAILED cleanly instead of a raw 30s timeout crash.        #
-        # ------------------------------------------------------------------ #
+        # Dead job detection
         current_url = page.url
         if current_url.rstrip("/") != url.rstrip("/"):
             result["logs"].append(
@@ -233,9 +340,6 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                 "el => el.dispatchEvent(new Event('blur', { bubbles: true }))"
             )
 
-        # ------------------------------------------------------------------ #
-        # Basic fields                                                        #
-        # ------------------------------------------------------------------ #
         fill_and_blur("input#first_name", candidate_profile.get("first_name", ""))
         fill_and_blur("input#last_name",  candidate_profile.get("last_name",  ""))
         fill_and_blur("input#email",      candidate_profile.get("email",      ""))
@@ -252,9 +356,7 @@ class GreenhouseApplyAgent(BaseApplyAgent):
         fill_and_blur("input#phone", clean_phone)
         page.wait_for_timeout(500)
 
-        # ------------------------------------------------------------------ #
-        # Resume upload                                                       #
-        # ------------------------------------------------------------------ #
+        # Resume upload
         if application.tailored_resume_pdf_path and os.path.exists(application.tailored_resume_pdf_path):
             try:
                 resume_input = page.locator("input[type='file']")
@@ -275,9 +377,7 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                 f"WARNING: No resume PDF found at '{application.tailored_resume_pdf_path}'. Skipping upload."
             )
 
-        # ------------------------------------------------------------------ #
-        # Scrape custom questions                                             #
-        # ------------------------------------------------------------------ #
+        # Scrape custom questions
         try:
             questions_data = page.evaluate("""() => {
                 const fields = [];
@@ -329,20 +429,15 @@ class GreenhouseApplyAgent(BaseApplyAgent):
             if not questions_data:
                 questions_data = []
 
-            # ------------------------------------------------------------------ #
-            # FIX #2 — Typeahead react-select support                           #
-            # If scraped options = [], type the profile value as search term     #
-            # to trigger the async options load, then re-collect.               #
-            # ------------------------------------------------------------------ #
             TYPEAHEAD_FIELD_HINTS = {
                 "candidate-location": candidate_profile.get("location", "Hyderabad"),
             }
 
+            # Scrape real options for react-select fields
             for field in questions_data:
                 if field.get("type") == "react-select":
                     real_opts = _get_react_select_options(page, field["id"])
                     if not real_opts:
-                        # Try typeahead — use hint if known, else fall back to first word of label
                         hint = TYPEAHEAD_FIELD_HINTS.get(
                             field["id"],
                             field.get("label", "").split()[0] if field.get("label") else ""
@@ -354,20 +449,41 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                                     f"Typeahead scraped options for {field['id']} (hint='{hint}'): {real_opts}"
                                 )
                     field["options"] = real_opts
-                    if real_opts:
-                        result["logs"].append(f"Scraped options for {field['id']}: {real_opts}")
+                    result["logs"].append(
+                        f"Scraped options for {field['id']}: {real_opts[:5]}{'...' if len(real_opts) > 5 else ''} ({len(real_opts)} total)"
+                    )
+
+            # ------------------------------------------------------------------ #
+            # Token saver: pre-resolve large option lists (country/state/etc.)   #
+            # and REMOVE them from the questions_data sent to the LLM.           #
+            # Store pre-resolved answers separately to fill afterwards.          #
+            # ------------------------------------------------------------------ #
+            pre_resolved: dict[str, str] = {}
+            llm_questions: list[dict] = []
+
+            for field in questions_data:
+                if field.get("type") == "react-select" and len(field.get("options", [])) > _MAX_OPTIONS_FOR_LLM:
+                    resolved = _pre_resolve_large_options(field, candidate_profile, result["logs"])
+                    if resolved:
+                        pre_resolved[field["id"]] = resolved
+                        result["logs"].append(
+                            f"Skipping {field['id']} from LLM payload (pre-resolved -> '{resolved}')"
+                        )
+                        continue  # don't send to LLM
                     else:
-                        result["logs"].append(f"Scraped options for {field['id']}: [] (typeahead, will plain-fill)")
+                        # Can't pre-resolve — truncate options to top 40 to limit tokens
+                        field = dict(field)  # shallow copy to avoid mutating original
+                        field["options"] = field["options"][:_MAX_OPTIONS_FOR_LLM]
+                        result["logs"].append(
+                            f"Truncated options for {field['id']} to {_MAX_OPTIONS_FOR_LLM} items for LLM"
+                        )
+                llm_questions.append(field)
 
             result["logs"].append(
-                f"Found {len(questions_data)} custom questions. Asking Groq for answers..."
+                f"Found {len(questions_data)} custom questions. "
+                f"{len(pre_resolved)} pre-resolved, {len(llm_questions)} sent to LLM."
             )
 
-            # ------------------------------------------------------------------ #
-            # FIX #3 — Groq option grounding                                    #
-            # Prompt explicitly instructs Groq to pick ONLY from options list.   #
-            # For checkbox groups, pass the options array so Groq picks the id. #
-            # ------------------------------------------------------------------ #
             prompt = f"""
 You are filling out a job application form for a candidate.
 
@@ -388,39 +504,29 @@ CRITICAL RULE FOR react-select FIELDS:
 - The `options` list contains the EXACT visible text of every choice available in that dropdown.
 - You MUST return one of those exact strings as the answer. Do NOT invent or paraphrase text.
 - If options is empty ([]), the field is a free-text typeahead — fill with the most appropriate value from the candidate profile.
-- Pick the most appropriate option given the candidate's profile.
 - For yes/no dropdowns: pick the option that starts with 'No' for negative answers.
 - For disability: pick the option that means 'No disability'.
 - For veteran: pick the option that means 'not a veteran'.
-- For country of residence: pick the option matching the candidate's country.
-- For skill level scales (e.g. ['0 (no experience)', '1', '2', '3', '4 (advanced)', '5 (expert)']): pick a NUMBER string, not 'Yes' or 'No'.
+- For skill level scales (e.g. ['Poor', 'Fair', 'Average', 'Good', 'Excellent'] or ['0', '1', '2', '3', '4', '5']): pick an appropriate level based on the candidate's skills.
 
 CRITICAL RULE FOR checkbox FIELDS:
-- The `options` array lists available checkboxes with their `id` and `label`.
-- Return the `id` of the checkbox that should be checked.
-- Do NOT return the field name as the value.
+- Return the `id` of the checkbox option to check (from the options array).
 
 CRITICAL RULE FOR radio FIELDS:
-- The `options` array lists available radio buttons with their `id` and `label`.
-- Return the `id` of the radio button to select.
+- Return the `id` of the radio button to select (from the options array).
 
 Form Fields:
-{json.dumps(questions_data, indent=2)}
+{json.dumps(llm_questions, indent=2)}
 
 Return a flat JSON object: keys = field `id`, values = the answer string.
 """
 
-            client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-            chat_completion = client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model="llama-3.3-70b-versatile",
-                response_format={"type": "json_object"},
-            )
-            answers = json.loads(chat_completion.choices[0].message.content)
+            answers = _call_llm_with_fallback(prompt, result["logs"])
 
-            # ------------------------------------------------------------------ #
-            # Fill each field                                                     #
-            # ------------------------------------------------------------------ #
+            # Merge pre-resolved answers into LLM answers
+            answers.update(pre_resolved)
+
+            # Fill each field
             for field_id, answer_val in answers.items():
                 if not field_id:
                     continue
@@ -447,7 +553,6 @@ Return a flat JSON object: keys = field `id`, values = the answer string.
                             result["logs"].append(
                                 f"WARNING: react-select failed for {field_id} = '{answer_val}'"
                             )
-                            # Fallback plain fill for typeahead fields (empty options)
                             if not field_info.get("options"):
                                 try:
                                     page.locator(f"input#{field_info['id']}").fill(str(answer_val), timeout=3000)
@@ -455,28 +560,18 @@ Return a flat JSON object: keys = field `id`, values = the answer string.
                                 except Exception:
                                     pass
 
-                    # ------------------------------------------------------------------ #
-                    # FIX #4 — Checkbox group handling                                  #
-                    # Detect name[] pattern and use .check() on the matching checkbox   #
-                    # instead of page.fill() which set the field name as its own value. #
-                    # ------------------------------------------------------------------ #
                     elif ftype == "checkbox":
-                        # answer_val should be the id of the checkbox to check
                         target_id = str(answer_val)
-                        # Guard: if Groq returned the field name instead of option id,
-                        # try to find the first option whose label/value implies "yes"
                         opts = field_info.get("options", [])
                         valid_ids = {o.get("id") for o in opts}
                         if target_id not in valid_ids and opts:
-                            # Fallback: pick first option that looks affirmative, else first option
                             affirmative = next(
                                 (o for o in opts if o.get("label", "").lower() in ("yes", "i agree", "true")),
                                 opts[0]
                             )
                             target_id = affirmative["id"]
                             result["logs"].append(
-                                f"Checkbox: Groq returned invalid id '{answer_val}', "
-                                f"using fallback '{target_id}'"
+                                f"Checkbox: LLM returned invalid id '{answer_val}', using fallback '{target_id}'"
                             )
                         page.locator(f"[id='{target_id}']").check(force=True, timeout=5000)
 
@@ -505,14 +600,12 @@ Return a flat JSON object: keys = field `id`, values = the answer string.
 
         page.wait_for_timeout(1500)
 
-        # Screenshot before submit
         try:
             page.screenshot(path=f"data/debug_before_submit_{application.id}.png", full_page=True)
             result["logs"].append(f"Debug screenshot saved.")
         except Exception:
             pass
 
-        # Block on visible validation errors
         try:
             raw_errors = page.locator(
                 ".field_with_errors, [class*='error']:visible, [class*='invalid']:visible"
@@ -527,7 +620,6 @@ Return a flat JSON object: keys = field `id`, values = the answer string.
 
         page.wait_for_timeout(500)
 
-        # Submit
         try:
             submit_btn = page.locator("input#submit_app, button#submit_app, button[type='submit']")
             if submit_btn.count() > 0:
