@@ -42,7 +42,15 @@ def ingest_jobs(db: Session, ingestors: list):
 
 
 if __name__ == "__main__":
-    from app.database import SessionLocal
+    from app.database import SessionLocal, Base, engine
+
+    # Auto-create all tables if the DB is fresh (e.g. after deleting the .db file)
+    # This is safe to call even when tables already exist — it's a no-op then.
+    import app.models.job          # noqa: F401 — ensure JobPosting model is registered
+    import app.models.application  # noqa: F401 — ensure Application model is registered
+    Base.metadata.create_all(bind=engine)
+    print("DB tables ensured.")
+
     db = SessionLocal()
 
     # Edit these lists to add more companies
