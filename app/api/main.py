@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from pydantic import BaseModel
+import os
 import time
 
 from app.database import engine, Base, get_db, SessionLocal
@@ -21,11 +22,31 @@ app = FastAPI(title="Naukari Sahaayta — Job Application Automation API")
 MAX_RETRIES = 5
 RETRY_BASE_DELAY = 30  # seconds; doubles each attempt: 30, 60, 120, 240, 480
 
-# Statuses considered "successfully applied" — hidden from default dashboard view
+# ------------------------------------------------------------------ #
+# Status taxonomy                                                      #
+# ------------------------------------------------------------------ #
+#
+# Terminal SUCCESS — never touch again, hidden from dashboard by default
 _APPLIED_STATUSES = {"AUTO_APPLIED", "APPLIED"}
 
-# Statuses eligible for process-all (unapplied + failed)
-_ACTIONABLE_STATUSES = ["PENDING", "MATCHED", "TAILORED", "FAILED", "VALIDATION_FAILED", "SKIPPED"]
+# Needs tailoring before applying (no valid PDF on disk yet)
+_NEEDS_TAILOR_STATUSES = {
+    "PENDING",        # fresh app, never tailored
+    "MATCHED",        # matched but not yet tailored
+    "RESUME_FAILED",  # tailor engine failed — must retailor, PDF was never produced
+}
+
+# Already tailored (PDF exists), only the apply step is needed
+_NEEDS_APPLY_STATUSES = {
+    "TAILORED",           # tailored successfully, not yet applied
+    "FAILED",             # apply step failed after a successful tailor
+    "VALIDATION_FAILED",  # form validation failed after tailor
+    "SKIPPED",            # was skipped earlier, retry apply now
+}
+
+# Everything process-all should act on (union of the two sets above)
+_ACTIONABLE_STATUSES = list(_NEEDS_TAILOR_STATUSES | _NEEDS_APPLY_STATUSES)
+
 
 # ------------------------------------------------------------------ #
 # In-memory state                                                      #
@@ -123,7 +144,7 @@ def _run_match_all(base_resume: str, batch_size: int, delay: int):
         match_status["running"] = False
         match_status["message"] = (
             f"Done! Matched {match_status['matched']} jobs"
-            + (f", {match_status['skipped']} skipped" if match_status['skipped'] else ".")
+            + (f", {match_status['skipped']} skipped" if match_status["skipped"] else ".")
         )
     except Exception as e:
         match_status["running"] = False
@@ -141,8 +162,12 @@ def _run_process_all(
 ):
     """
     Background task: tailor then apply every qualifying actionable application.
-    Actionable = status in _ACTIONABLE_STATUSES (includes FAILED/SKIPPED for retries)
-    and fit_score >= fit_threshold.
+
+    Status routing:
+      PENDING, MATCHED, RESUME_FAILED  →  tailor + apply
+      TAILORED, FAILED,
+      VALIDATION_FAILED, SKIPPED       →  apply only (PDF already on disk)
+
     Successfully applied (AUTO_APPLIED / APPLIED) are never touched.
     """
     global process_status
@@ -153,7 +178,6 @@ def _run_process_all(
             "current_job": "", "message": "starting"
         })
 
-        # Fetch all qualifying apps that are unapplied OR failed (for retry)
         apps = (
             db.query(Application)
             .join(JobPosting, Application.job_id == JobPosting.id)
@@ -168,12 +192,45 @@ def _run_process_all(
         process_status["total"] = len(apps)
         process_status["remaining"] = len(apps)
 
+        # Early exit with a clear, informative message instead of "Applied to 0 jobs"
+        if not apps:
+            process_status["running"] = False
+            process_status["message"] = (
+                f"No actionable applications found. "
+                f"All jobs are either already applied (AUTO_APPLIED/APPLIED) "
+                f"or below the score threshold ({fit_threshold}). "
+                f"Check dashboard with ?include_applied=true to see full history."
+            )
+            print(f"[process-all] {process_status['message']}")
+            return
+
+        print(f"[process-all] Found {len(apps)} actionable apps to process.")
+
         for app_entry in apps:
             job = db.query(JobPosting).filter(JobPosting.id == app_entry.job_id).first()
             job_label = f"{job.title} @ {job.company}" if job else f"App #{app_entry.id}"
 
-            # --- Step 1: Tailor (skip if already tailored) ---
-            if app_entry.status not in ("TAILORED", "FAILED", "VALIDATION_FAILED", "SKIPPED"):
+            # ----------------------------------------------------------
+            # Step 1: Decide whether to tailor
+            # ----------------------------------------------------------
+            # Primary check: status tells us tailor is needed
+            needs_tailor = app_entry.status in _NEEDS_TAILOR_STATUSES
+
+            # Safety net: status says TAILORED/FAILED but PDF is missing on disk
+            # (e.g. data/ folder was wiped) — force retailor to avoid apply crash
+            if not needs_tailor:
+                pdf_ok = (
+                    app_entry.tailored_resume_pdf_path
+                    and os.path.isfile(app_entry.tailored_resume_pdf_path)
+                )
+                if not pdf_ok:
+                    print(
+                        f"[process-all] App {app_entry.id}: status={app_entry.status} "
+                        f"but PDF missing on disk — forcing retailor."
+                    )
+                    needs_tailor = True
+
+            if needs_tailor:
                 try:
                     process_status["current_job"] = f"Tailoring: {job_label}"
                     process_status["message"] = process_status["current_job"]
@@ -199,7 +256,9 @@ def _run_process_all(
                         process_status["remaining"] -= 1
                         continue
 
-            # --- Step 2: Apply ---
+            # ----------------------------------------------------------
+            # Step 2: Apply
+            # ----------------------------------------------------------
             try:
                 process_status["current_job"] = f"Applying: {job_label}"
                 process_status["message"] = process_status["current_job"]
@@ -221,7 +280,7 @@ def _run_process_all(
         process_status["current_job"] = ""
         process_status["message"] = (
             f"Done! Applied to {process_status['processed']} jobs"
-            + (f", {process_status['failed']} failed" if process_status['failed'] else ".")
+            + (f", {process_status['failed']} failed." if process_status["failed"] else ".")
         )
     except Exception as e:
         process_status["running"] = False
@@ -379,12 +438,13 @@ def read_applications(
     List applications.
 
     Default behaviour (include_applied=false):
-      Returns only actionable applications — those that still need attention:
-      PENDING, MATCHED, TAILORED, FAILED, VALIDATION_FAILED, SKIPPED.
+      Returns every application still needing attention — PENDING, MATCHED,
+      TAILORED, FAILED, VALIDATION_FAILED, SKIPPED, RESUME_FAILED.
       Successfully applied jobs (AUTO_APPLIED / APPLIED) are hidden to keep
-      the dashboard clean.
+      the dashboard clean and focused on actionable items.
 
-    Pass ?include_applied=true to see the full history including applied jobs.
+    Pass ?include_applied=true to see full history including applied jobs.
+    Pass ?status=RESUME_FAILED to filter to a specific status.
     """
     q = db.query(Application)
 
@@ -392,7 +452,7 @@ def read_applications(
         # Explicit status filter overrides include_applied
         q = q.filter(Application.status == status.upper())
     elif not include_applied:
-        # Default: hide successfully applied
+        # Default: show everything EXCEPT successfully applied jobs
         q = q.filter(Application.status.notin_(list(_APPLIED_STATUSES)))
 
     if min_score is not None:
