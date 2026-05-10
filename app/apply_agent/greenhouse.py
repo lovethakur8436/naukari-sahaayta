@@ -3,6 +3,7 @@ from app.apply_agent.base import BaseApplyAgent
 from app.apply_agent.form_resolver import resolve_apply_form, get_form_frame
 from app.apply_agent.submit_guard import (
     get_safe_default,
+    pick_best_remote_option,
     _scan_required_empty,
     submit_with_retry,
 )
@@ -51,7 +52,6 @@ def _resolve_resume_path(application: Application, logs: list) -> str | None:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # react-select helpers
-# NOTE: `page` is always the root Page object — Frame does not have .keyboard
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_react_select_options(frame, field_id: str, page: Page = None) -> list[str]:
@@ -87,7 +87,9 @@ def _get_react_select_options(frame, field_id: str, page: Page = None) -> list[s
     return texts
 
 
-def _get_react_select_options_typeahead(frame, field_id: str, search_term: str, page: Page = None) -> list[str]:
+def _get_react_select_options_typeahead(
+    frame, field_id: str, search_term: str, page: Page = None
+) -> list[str]:
     input_el = frame.locator(f"input{_safe_css_id(field_id)}")
     control_div = frame.locator(
         f"xpath=//input[@id='{field_id}']/ancestor::div[contains(@class,'select__control')]"
@@ -129,7 +131,9 @@ def _get_react_select_options_typeahead(frame, field_id: str, search_term: str, 
     return texts
 
 
-def _fill_react_select(frame, field_id: str, answer_text: str, logs: list, page: Page = None) -> bool:
+def _fill_react_select(
+    frame, field_id: str, answer_text: str, logs: list, page: Page = None
+) -> bool:
     if not answer_text or not answer_text.strip():
         logs.append(f"react-select: skipping '{field_id}' — empty answer, leaving blank")
         return False
@@ -153,7 +157,9 @@ def _fill_react_select(frame, field_id: str, answer_text: str, logs: list, page:
     except Exception as e:
         logs.append(f"react-select type failed for {field_id}: {e}")
 
-    listbox = frame.locator(f"[id='react-select-{field_id}-listbox'], div[role='listbox']").first
+    listbox = frame.locator(
+        f"[id='react-select-{field_id}-listbox'], div[role='listbox']"
+    ).first
     try:
         listbox.wait_for(state="visible", timeout=4000)
     except Exception:
@@ -182,27 +188,33 @@ def _fill_react_select(frame, field_id: str, answer_text: str, logs: list, page:
         except Exception:
             option_texts.append("")
 
-    logs.append(f"react-select: {count} options for {field_id}, want '{answer_text}': {option_texts}")
+    logs.append(
+        f"react-select: {count} options for {field_id}, want '{answer_text}': {option_texts}"
+    )
 
     matched_idx = None
     for i, t in enumerate(option_texts):
         if t == answer_text:
-            matched_idx = i; break
+            matched_idx = i
+            break
     if matched_idx is None:
         for i, t in enumerate(option_texts):
             if t.lower() == answer_text.lower():
                 matched_idx = i
-                logs.append(f"react-select: case-matched -> '{t}'"); break
+                logs.append(f"react-select: case-matched -> '{t}'")
+                break
     if matched_idx is None:
         for i, t in enumerate(option_texts):
             if t.lower().startswith(answer_text.lower()):
                 matched_idx = i
-                logs.append(f"react-select: startswith-matched -> '{t}'"); break
+                logs.append(f"react-select: startswith-matched -> '{t}'")
+                break
     if matched_idx is None:
         for i, t in enumerate(option_texts):
             if answer_text.lower() in t.lower():
                 matched_idx = i
-                logs.append(f"react-select: partial-matched -> '{t}'"); break
+                logs.append(f"react-select: partial-matched -> '{t}'")
+                break
 
     if matched_idx is None:
         logs.append(f"react-select: NO MATCH for '{answer_text}' in {option_texts}")
@@ -224,6 +236,28 @@ def _fill_react_select(frame, field_id: str, answer_text: str, logs: list, page:
         return False
 
 
+def _fill_react_select_remote(
+    frame, field_id: str, logs: list, page: Page = None
+) -> bool:
+    """
+    Special handler for remote-preference dropdowns.
+    Enumerates ALL available options first, then picks the best match
+    using pick_best_remote_option() — avoids hardcoding any specific string.
+    """
+    live_opts = _get_react_select_options(frame, field_id, page=page)
+    if not live_opts:
+        logs.append(f"react-select remote: could not enumerate options for '{field_id}'")
+        return False
+    best = pick_best_remote_option(live_opts)
+    if not best:
+        logs.append(f"react-select remote: no suitable option found in {live_opts}")
+        return False
+    logs.append(
+        f"react-select remote: picked '{best}' from {live_opts} for '{field_id}'"
+    )
+    return _fill_react_select(frame, field_id, best, logs, page=page)
+
+
 def _clean_phone(phone: str) -> str:
     if not phone:
         return phone
@@ -241,7 +275,10 @@ _LARGE_LIST_PROFILE_KEYS = {
     "region":      "state",
 }
 
-def _pre_resolve_large_options(field: dict, candidate_profile: dict, logs: list) -> str | None:
+
+def _pre_resolve_large_options(
+    field: dict, candidate_profile: dict, logs: list
+) -> str | None:
     opts = field.get("options", [])
     if len(opts) <= _MAX_OPTIONS_FOR_LLM:
         return None
@@ -287,11 +324,19 @@ def _call_llm_with_fallback(prompt: str, logs: list) -> dict:
             return json.loads(resp.choices[0].message.content)
         except Exception as groq_err:
             err_str = str(groq_err)
-            is_rate_limit = "429" in err_str or "rate_limit_exceeded" in err_str or "tokens per day" in err_str
+            is_rate_limit = (
+                "429" in err_str
+                or "rate_limit_exceeded" in err_str
+                or "tokens per day" in err_str
+            )
             if is_rate_limit:
-                logs.append(f"Groq rate-limit hit: {err_str[:200]}. Falling back to Gemini Flash.")
+                logs.append(
+                    f"Groq rate-limit hit: {err_str[:200]}. Falling back to Gemini Flash."
+                )
             else:
-                logs.append(f"Groq error (non-429): {err_str[:200]}. Falling back to Gemini Flash.")
+                logs.append(
+                    f"Groq error (non-429): {err_str[:200]}. Falling back to Gemini Flash."
+                )
     else:
         logs.append("GROQ_API_KEY not set. Falling back to Gemini Flash.")
 
@@ -306,7 +351,10 @@ def _call_llm_with_fallback(prompt: str, logs: list) -> dict:
         genai.configure(api_key=gemini_key)
         model = genai.GenerativeModel(
             model_name="gemini-1.5-flash",
-            generation_config={"response_mime_type": "application/json", "temperature": 0.1},
+            generation_config={
+                "response_mime_type": "application/json",
+                "temperature": 0.1,
+            },
         )
         response = model.generate_content(prompt)
         logs.append("LLM: Gemini Flash responded OK")
@@ -320,6 +368,59 @@ def _call_llm_with_fallback(prompt: str, logs: list) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# JS for scraping custom questions
+# Stored as a plain concatenated string to avoid Python triple-quote /
+# JS backtick conflicts that caused 'SyntaxError: Unexpected end of input'.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SCRAPE_QUESTIONS_JS = (
+    "() => {"
+    "  var fields = [];"
+    "  var skip = new Set(['first_name','last_name','email','phone','country']);"
+    "  var els = document.querySelectorAll("
+    "    'input[role=\"combobox\"],'"
+    "    + 'input[type=\"text\"]:not([role=\"combobox\"]):not([hidden]),'"
+    "    + 'textarea:not([hidden]),'"
+    "    + 'input[type=\"checkbox\"]:not([hidden]),'"
+    "    + 'input[type=\"radio\"]:not([hidden])'"
+    "  );"
+    "  els.forEach(function(el) {"
+    "    if (skip.has(el.id)) return;"
+    "    if ((el.className || '').includes('recaptcha')) return;"
+    "    if ((el.id || '').includes('recaptcha')) return;"
+    "    if (el.offsetWidth === 0 && el.offsetHeight === 0) return;"
+    "    var container = el.closest('div.field-wrapper, div.field, div.custom_question');"
+    "    var labelEl = document.querySelector('label[for=\"' + el.id + '\"]')"
+    "                || (container && container.querySelector('label'));"
+    "    var label = labelEl ? labelEl.innerText.replace('*','').trim() : (el.name || el.id);"
+    "    var isRequired = el.required"
+    "      || el.getAttribute('aria-required') === 'true'"
+    "      || !!(labelEl && labelEl.innerText.includes('*'));"
+    "    var fi = { id: el.id, name: el.name || '', label: label, required: isRequired };"
+    "    if (el.getAttribute('role') === 'combobox') {"
+    "      fi.type = 'react-select';"
+    "      fi.options = [];"
+    "    } else if (el.type === 'checkbox') {"
+    "      fi.type = 'checkbox';"
+    "      var ex = fields.find(function(f) { return f.name === fi.name && f.type === 'checkbox'; });"
+    "      if (ex) { ex.options.push({ value: el.value, id: el.id, label: label }); return; }"
+    "      fi.options = [{ value: el.value, id: el.id, label: label }];"
+    "    } else if (el.type === 'radio') {"
+    "      fi.type = 'radio';"
+    "      var ex2 = fields.find(function(f) { return f.name === fi.name && f.type === 'radio'; });"
+    "      if (ex2) { ex2.options.push({ value: el.value, id: el.id, label: label }); return; }"
+    "      fi.options = [{ value: el.value, id: el.id, label: label }];"
+    "    } else {"
+    "      fi.type = 'text';"
+    "    }"
+    "    fields.push(fi);"
+    "  });"
+    "  return fields;"
+    "}"
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Universal field refill callback (used by submit_with_retry)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -330,19 +431,30 @@ def _refill_field(frame, field_info: dict, answer: str, logs: list, page: Page):
     callback passed to submit_with_retry.
     """
     ftype = field_info.get("type", "text")
-    fid   = field_info.get("id", "")
+    fid = field_info.get("id", "")
     fname = field_info.get("name", "")
 
     if ftype == "react-select":
-        _fill_react_select(frame, fid, answer, logs, page=page)
+        # For remote-preference fields, use the dedicated remote handler
+        label_lower = (field_info.get("label") or "").lower()
+        is_remote = bool(re.search(
+            r"remote|work.{0,10}(from|preference|location)|plan.{0,10}work.{0,10}remote",
+            label_lower
+        ))
+        if is_remote:
+            _fill_react_select_remote(frame, fid, logs, page=page)
+        else:
+            _fill_react_select(frame, fid, answer, logs, page=page)
 
     elif ftype == "checkbox":
         opts = field_info.get("options", [])
-        # answer may be a label string or an id string
         target = next(
-            (o["id"] for o in opts
-             if answer.lower() in (o.get("label", "") + o.get("id", "")).lower()),
-            None
+            (
+                o["id"]
+                for o in opts
+                if answer.lower() in (o.get("label", "") + o.get("id", "")).lower()
+            ),
+            None,
         )
         if target:
             try:
@@ -366,13 +478,21 @@ def _refill_field(frame, field_info: dict, answer: str, logs: list, page: Page):
 
 
 class GreenhouseApplyAgent(BaseApplyAgent):
-    def run_apply_flow(self, page: Page, application: Application, candidate_profile: dict, result: dict):
+    def run_apply_flow(
+        self,
+        page: Page,
+        application: Application,
+        candidate_profile: dict,
+        result: dict,
+    ):
         url = application.job.url
         result["logs"].append(f"Navigating to {url}")
         page.goto(url)
         page.wait_for_load_state("networkidle")
 
-        form_found, is_iframe_embed = resolve_apply_form(page, result["logs"], app_id=application.id)
+        form_found, is_iframe_embed = resolve_apply_form(
+            page, result["logs"], app_id=application.id
+        )
         if not form_found:
             result["logs"].append(
                 "No apply form found after exhausting all strategies. "
@@ -383,7 +503,9 @@ class GreenhouseApplyAgent(BaseApplyAgent):
 
         result["logs"].append(f"Apply form located at: {page.url}")
         if is_iframe_embed:
-            result["logs"].append("Form is inside an iframe — switching to iframe frame context")
+            result["logs"].append(
+                "Form is inside an iframe — switching to iframe frame context"
+            )
 
         frame = get_form_frame(page, is_iframe_embed)
 
@@ -409,8 +531,12 @@ class GreenhouseApplyAgent(BaseApplyAgent):
             return
 
         country_from_profile = candidate_profile.get("country", "India")
-        result["logs"].append(f"Setting phone country selector to '{country_from_profile}'")
-        ok = _fill_react_select(frame, "country", country_from_profile, result["logs"], page=page)
+        result["logs"].append(
+            f"Setting phone country selector to '{country_from_profile}'"
+        )
+        ok = _fill_react_select(
+            frame, "country", country_from_profile, result["logs"], page=page
+        )
         if not ok:
             result["logs"].append("WARNING: country selector failed")
 
@@ -430,13 +556,19 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                 resume_input = frame.locator("input[type='file']")
                 if resume_input.count() > 0:
                     resume_input.first.set_input_files(resume_path)
-                    result["logs"].append(f"Resume uploaded via file input: {resume_path}")
+                    result["logs"].append(
+                        f"Resume uploaded via file input: {resume_path}"
+                    )
                 else:
-                    attach_btn = frame.locator("button:has-text('Attach'), label:has-text('Attach')").first
+                    attach_btn = frame.locator(
+                        "button:has-text('Attach'), label:has-text('Attach')"
+                    ).first
                     with page.expect_file_chooser() as fc_info:
                         attach_btn.click()
                     fc_info.value.set_files(resume_path)
-                    result["logs"].append(f"Resume uploaded via Attach button: {resume_path}")
+                    result["logs"].append(
+                        f"Resume uploaded via Attach button: {resume_path}"
+                    )
                 frame.wait_for_timeout(1000)
             except Exception as e:
                 result["logs"].append(f"Resume upload failed: {e}")
@@ -444,67 +576,67 @@ class GreenhouseApplyAgent(BaseApplyAgent):
         # ── Custom questions ───────────────────────────────────────────────
         questions_data: list[dict] = []
         try:
-            questions_data = frame.evaluate("""() => {
-                const fields = [];
-                const skip = new Set(['first_name','last_name','email','phone','country']);
-                const els = document.querySelectorAll(
-                    'input[role="combobox"],'
-                    + 'input[type="text"]:not([role="combobox"]):not([hidden]),'
-                    + 'textarea:not([hidden]),'
-                    + 'input[type="checkbox"]:not([hidden]),'
-                    + 'input[type="radio"]:not([hidden])'
-                );
-                els.forEach(el => {
-                    if (skip.has(el.id)) return;
-                    if ((el.className || '').includes('recaptcha')) return;
-                    if ((el.id || '').includes('recaptcha')) return;
-                    if (el.offsetWidth === 0 && el.offsetHeight === 0) return;
-
-                    const container = el.closest('div.field-wrapper, div.field, div.custom_question');
-                    const labelEl   = document.querySelector(`label[for="${el.id}"]`)
-                                   || container?.querySelector('label');
-                    let label = labelEl ? labelEl.innerText.replace('*','').trim() : (el.name || el.id);
-                    const isRequired = el.required
-                        || el.getAttribute('aria-required') === 'true'
-                        || !!(labelEl && labelEl.innerText.includes('*'));
-
-                    let fi = { id: el.id, name: el.name || '', label, required: isRequired };
-
-                    if (el.getAttribute('role') === 'combobox') {
-                        fi.type = 'react-select';
-                        fi.options = [];
-                    } else if (el.type === 'checkbox') {
-                        fi.type = 'checkbox';
-                        const ex = fields.find(f => f.name === fi.name && f.type === 'checkbox');
-                        if (ex) { ex.options.push({ value: el.value, id: el.id, label }); return; }
-                        fi.options = [{ value: el.value, id: el.id, label }];
-                    } else if (el.type === 'radio') {
-                        fi.type = 'radio';
-                        const ex = fields.find(f => f.name === fi.name && f.type === 'radio');
-                        if (ex) { ex.options.push({ value: el.value, id: el.id, label }); return; }
-                        fi.options = [{ value: el.value, id: el.id, label }];
-                    } else {
-                        fi.type = 'text';
-                    }
-                    fields.push(fi);
-                });
-                return fields;
-            """)
+            # Use pre-built JS string (no triple-quote / backtick interpolation)
+            questions_data = frame.evaluate(_SCRAPE_QUESTIONS_JS)
 
             if not questions_data:
                 questions_data = []
 
-            TYPEAHEAD_FIELD_HINTS = {
+            # candidate-location is a typeahead — fill directly instead of
+            # trying to match it as a normal react-select dropdown, which
+            # previously produced zero options and left the field blank.
+            DIRECT_FILL_FIELDS: dict[str, str] = {
                 "candidate-location": candidate_profile.get("location", "Hyderabad"),
             }
 
+            for field_id, fill_value in DIRECT_FILL_FIELDS.items():
+                try:
+                    el = frame.locator(f"input{_safe_css_id(field_id)}")
+                    if el.count() > 0:
+                        el.fill(fill_value, timeout=3000)
+                        el.evaluate(
+                            "el => el.dispatchEvent(new Event('input', { bubbles: true }))"
+                        )
+                        frame.wait_for_timeout(600)
+                        # Pick the first autocomplete suggestion if any appear
+                        suggestion = frame.locator(
+                            f"div[role='option']:visible, "
+                            f"[id^='react-select-{field_id}-option']:visible"
+                        ).first
+                        if suggestion.count() > 0:
+                            suggestion.click(timeout=2000)
+                            result["logs"].append(
+                                f"Direct-fill '{field_id}': picked suggestion '{suggestion.inner_text()}'"
+                            )
+                        else:
+                            el.evaluate(
+                                "el => el.dispatchEvent(new Event('blur', { bubbles: true }))"
+                            )
+                            result["logs"].append(
+                                f"Direct-fill '{field_id}' = '{fill_value}' (no suggestion, blurred)"
+                            )
+                        # Remove from LLM questions to avoid duplicate filling
+                        questions_data = [
+                            q for q in questions_data if q.get("id") != field_id
+                        ]
+                except Exception as df_err:
+                    result["logs"].append(
+                        f"Direct-fill '{field_id}' failed: {df_err}"
+                    )
+
+            TYPEAHEAD_FIELD_HINTS: dict[str, str] = {}
+
             for field in questions_data:
                 if field.get("type") == "react-select":
-                    real_opts = _get_react_select_options(frame, field["id"], page=page)
+                    real_opts = _get_react_select_options(
+                        frame, field["id"], page=page
+                    )
                     if not real_opts:
                         hint = TYPEAHEAD_FIELD_HINTS.get(
                             field["id"],
-                            field.get("label", "").split()[0] if field.get("label") else ""
+                            field.get("label", "").split()[0]
+                            if field.get("label")
+                            else "",
                         )
                         if hint:
                             real_opts = _get_react_select_options_typeahead(
@@ -512,7 +644,8 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                             )
                             if real_opts:
                                 result["logs"].append(
-                                    f"Typeahead scraped options for {field['id']} (hint='{hint}'): {real_opts}"
+                                    f"Typeahead scraped options for {field['id']} "
+                                    f"(hint='{hint}'): {real_opts}"
                                 )
                     field["options"] = real_opts
                     result["logs"].append(
@@ -524,19 +657,26 @@ class GreenhouseApplyAgent(BaseApplyAgent):
             llm_questions: list[dict] = []
 
             for field in questions_data:
-                if field.get("type") == "react-select" and len(field.get("options", [])) > _MAX_OPTIONS_FOR_LLM:
-                    resolved = _pre_resolve_large_options(field, candidate_profile, result["logs"])
+                if (
+                    field.get("type") == "react-select"
+                    and len(field.get("options", [])) > _MAX_OPTIONS_FOR_LLM
+                ):
+                    resolved = _pre_resolve_large_options(
+                        field, candidate_profile, result["logs"]
+                    )
                     if resolved:
                         pre_resolved[field["id"]] = resolved
                         result["logs"].append(
-                            f"Skipping {field['id']} from LLM payload (pre-resolved -> '{resolved}')"
+                            f"Skipping {field['id']} from LLM payload "
+                            f"(pre-resolved -> '{resolved}')"
                         )
                         continue
                     else:
                         field = dict(field)
                         field["options"] = field["options"][:_MAX_OPTIONS_FOR_LLM]
                         result["logs"].append(
-                            f"Truncated options for {field['id']} to {_MAX_OPTIONS_FOR_LLM} items for LLM"
+                            f"Truncated options for {field['id']} to "
+                            f"{_MAX_OPTIONS_FOR_LLM} items for LLM"
                         )
                 llm_questions.append(field)
 
@@ -560,9 +700,17 @@ INSTRUCTIONS:
 6. Reasonable accommodation -> "No" or leave blank.
 7. Gender/veteran/disability/hispanic -> use corresponding profile fields.
 8. "How did you hear" -> "LinkedIn".
-9. OPTIONAL FIELDS: If a field is optional and you have no clear answer, omit the key entirely
-   or return null — do NOT return an empty string "". Returning "" will silently pick
-   the first available option, which is almost always wrong.
+9. WhatsApp opt-in / messaging consent -> prefer 'No' or 'I do not consent' options.
+10. Interview recording consent (BrightHire etc.) -> prefer 'Yes' or 'I consent' — required to proceed.
+11. Country where you currently reside -> "India".
+12. Work authorization -> "Yes" (candidate is authorized to work in India).
+13. Previously employed at this company -> "No".
+14. Current/previous job title -> "Software Engineer".
+15. School attended -> "Maharshi Dayanand University".
+16. Degree obtained -> match nearest available option to "Bachelor of Technology" or "B.Tech".
+17. OPTIONAL FIELDS: If a field is optional and you have no clear answer, omit the key entirely
+    or return null — do NOT return an empty string "". Returning "" will silently pick
+    the first available option, which is almost always wrong.
 
 CRITICAL RULE FOR react-select FIELDS:
 - The `options` list contains the EXACT visible text of every choice available in that dropdown.
@@ -571,8 +719,9 @@ CRITICAL RULE FOR react-select FIELDS:
 - For yes/no dropdowns: pick the option that starts with 'No' for negative answers.
 - For disability: pick the option that means 'No disability'.
 - For veteran: pick the option that means 'not a veteran'.
-- For skill level scales (e.g. ['Poor', 'Fair', 'Average', 'Good', 'Excellent'] or ['0', '1', '2', '3', '4', '5']): pick an appropriate level based on the candidate's skills.
-- For multi-select checkbox-style questions (e.g. 'Which areas do you work in?'), return a comma-separated string of the options that apply.
+- For skill level scales (e.g. ['Poor', 'Fair', 'Average', 'Good', 'Excellent']): pick an appropriate level.
+- For remote preference: pick the option closest to 'Yes / Open to remote or hybrid'.
+- For multi-select checkbox-style questions, return a comma-separated string of the matching option IDs.
 
 CRITICAL RULE FOR checkbox FIELDS:
 - Return the `id` of the checkbox option to check (from the options array).
@@ -593,11 +742,14 @@ Return a flat JSON object: keys = field `id`, values = the answer string (or omi
                 if not field_id:
                     continue
 
-                # ── NULL / EMPTY ANSWER: try SAFE_DEFAULTS before skipping ──
                 if answer_val is None or str(answer_val).strip() == "":
                     field_info = next(
-                        (f for f in questions_data if f["id"] == field_id or f["name"] == field_id),
-                        None
+                        (
+                            f
+                            for f in questions_data
+                            if f["id"] == field_id or f["name"] == field_id
+                        ),
+                        None,
                     )
                     if field_info and field_info.get("required"):
                         opts = field_info.get("options", [])
@@ -606,10 +758,13 @@ Return a flat JSON object: keys = field `id`, values = the answer string (or omi
                             if opts and isinstance(opts[0], dict)
                             else opts
                         )
-                        safe = get_safe_default(field_info.get("label", ""), opt_labels)
+                        safe = get_safe_default(
+                            field_info.get("label", ""), opt_labels
+                        )
                         if safe:
                             result["logs"].append(
-                                f"LLM null for required '{field_id}' ('{field_info['label']}') "
+                                f"LLM null for required '{field_id}' "
+                                f"('{field_info['label']}') "
                                 f"— applying safe default: '{safe}'"
                             )
                             answer_val = safe
@@ -619,17 +774,25 @@ Return a flat JSON object: keys = field `id`, values = the answer string (or omi
                             )
                             continue
                     else:
-                        result["logs"].append(f"Skipping optional '{field_id}' — LLM returned null")
+                        result["logs"].append(
+                            f"Skipping optional '{field_id}' — LLM returned null"
+                        )
                         continue
 
                 try:
                     field_info = next(
-                        (f for f in questions_data if f["id"] == field_id or f["name"] == field_id),
-                        None
+                        (
+                            f
+                            for f in questions_data
+                            if f["id"] == field_id or f["name"] == field_id
+                        ),
+                        None,
                     )
                     if not field_info:
                         for q in questions_data:
-                            if any(o.get("id") == field_id for o in q.get("options", [])):
+                            if any(
+                                o.get("id") == field_id for o in q.get("options", [])
+                            ):
                                 field_info = q
                                 break
                     if not field_info:
@@ -638,32 +801,56 @@ Return a flat JSON object: keys = field `id`, values = the answer string (or omi
                     ftype = field_info.get("type", "text")
 
                     if ftype == "react-select":
-                        ok = _fill_react_select(
-                            frame, field_info["id"], str(answer_val), result["logs"], page=page
-                        )
+                        label_lower = (field_info.get("label") or "").lower()
+                        is_remote = bool(re.search(
+                            r"remote|work.{0,10}(from|preference|location)"
+                            r"|plan.{0,10}work.{0,10}remote",
+                            label_lower,
+                        ))
+                        if is_remote:
+                            ok = _fill_react_select_remote(
+                                frame, field_info["id"], result["logs"], page=page
+                            )
+                        else:
+                            ok = _fill_react_select(
+                                frame,
+                                field_info["id"],
+                                str(answer_val),
+                                result["logs"],
+                                page=page,
+                            )
                         if not ok:
-                            result["logs"].append(f"WARNING: react-select failed for {field_id} = '{answer_val}'")
+                            result["logs"].append(
+                                f"WARNING: react-select failed for {field_id} = '{answer_val}'"
+                            )
                             if not field_info.get("options"):
                                 try:
-                                    frame.locator(f"input{_safe_css_id(field_info['id'])}").fill(
-                                        str(answer_val), timeout=3000
-                                    )
+                                    frame.locator(
+                                        f"input{_safe_css_id(field_info['id'])}"
+                                    ).fill(str(answer_val), timeout=3000)
                                     result["logs"].append(
-                                        f"Typeahead plain-fill fallback: {field_id} = '{answer_val}'"
+                                        f"Typeahead plain-fill fallback: "
+                                        f"{field_id} = '{answer_val}'"
                                     )
                                 except Exception:
                                     pass
 
                     elif ftype == "checkbox":
-                        target_ids = [s.strip() for s in str(answer_val).split(",") if s.strip()]
+                        target_ids = [
+                            s.strip() for s in str(answer_val).split(",") if s.strip()
+                        ]
                         opts = field_info.get("options", [])
                         valid_ids = {o.get("id") for o in opts}
                         for target_id in target_ids:
                             if target_id not in valid_ids and opts:
                                 matched_opt = next(
-                                    (o for o in opts
-                                     if target_id.lower() in o.get("label", "").lower()),
-                                    None
+                                    (
+                                        o
+                                        for o in opts
+                                        if target_id.lower()
+                                        in o.get("label", "").lower()
+                                    ),
+                                    None,
                                 )
                                 if matched_opt:
                                     target_id = matched_opt["id"]
@@ -676,8 +863,12 @@ Return a flat JSON object: keys = field `id`, values = the answer string (or omi
                                     )
                                     continue
                             try:
-                                frame.locator(f"[id='{target_id}']").check(force=True, timeout=5000)
-                                result["logs"].append(f"Checked checkbox '{target_id}'")
+                                frame.locator(f"[id='{target_id}']").check(
+                                    force=True, timeout=5000
+                                )
+                                result["logs"].append(
+                                    f"Checked checkbox '{target_id}'"
+                                )
                             except Exception as e:
                                 result["logs"].append(
                                     f"Checkbox check failed for '{target_id}': {e}"
@@ -686,7 +877,9 @@ Return a flat JSON object: keys = field `id`, values = the answer string (or omi
                     elif ftype == "radio":
                         el = frame.locator(f"[id='{answer_val}']")
                         el.click(force=True, timeout=5000)
-                        el.evaluate("el => el.dispatchEvent(new Event('change', { bubbles: true }))")
+                        el.evaluate(
+                            "el => el.dispatchEvent(new Event('change', { bubbles: true }))"
+                        )
 
                     else:
                         sel = (

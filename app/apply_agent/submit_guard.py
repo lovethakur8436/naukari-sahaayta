@@ -34,58 +34,151 @@ if TYPE_CHECKING:
 # ─────────────────────────────────────────────────────────────────────────────
 
 SAFE_DEFAULTS: list[tuple[str, str | list]] = [
-    # Experience / seniority
+    # ── Experience / seniority ────────────────────────────────────────────
     (r"years.{0,20}experience|experience.{0,20}years",  "3-4 years"),
     (r"how many years",                                  "3-4 years"),
     (r"level of experience|seniority",                   "Mid-level"),
 
-    # Specialization / domain checkboxes
+    # ── Specialization / domain checkboxes ───────────────────────────────
     (r"specializ|area.{0,15}work|domain",               ["Backend", "Full-Stack"]),
     (r"which.{0,20}area",                               ["Backend"]),
 
-    # Programming languages checkboxes
+    # ── Programming languages checkboxes ─────────────────────────────────
     (r"language|tech.?stack|primary.{0,10}language",    ["Python", "Java"]),
 
-    # Pronouns — safest to decline
+    # ── Pronouns ──────────────────────────────────────────────────────────
     (r"pronoun",                                         "he/him/his"),
 
-    # Portfolio / personal site
+    # ── Portfolio / personal site ─────────────────────────────────────────
     (r"portfolio|personal.?site|website",               "https://github.com/lovethakur8436"),
 
-    # Cover letter / motivation — short safe answer
-    (r"cover.?letter|why.{0,20}(us|company|role)|motivation",
-     "I am excited about this opportunity and believe my skills align well with the role."),
+    # ── Cover letter / motivation ─────────────────────────────────────────
+    (r"cover.?letter|why.{0,20}(us|company|role)|motivation|interested in",
+     "I am excited about this opportunity and believe my skills in backend engineering "
+     "and API development align well with the role."),
 
-    # Salary / compensation
+    # ── Salary / compensation ─────────────────────────────────────────────
     (r"salary|compensation|expected.{0,10}pay",          "Open to discussion"),
 
-    # Notice period / availability
+    # ── Notice period / availability ──────────────────────────────────────
     (r"notice.?period|start.?date|when.{0,15}start|available", "30 days"),
 
-    # Relocation
+    # ── Relocation ────────────────────────────────────────────────────────
     (r"relocat",                                         "Yes"),
 
-    # Visa / sponsorship — candidate does NOT need sponsorship
-    (r"sponsor|visa|work.{0,15}authoriz",                "No"),
+    # ── Visa / sponsorship — candidate does NOT need sponsorship ─────────
+    (r"sponsor|visa",                                    "No"),
 
-    # Remote preference
-    (r"remote|work.{0,10}(from|preference)",             "Open to remote or hybrid"),
+    # ── Work authorization ────────────────────────────────────────────────
+    (r"authoriz.{0,30}work|work.{0,30}authoriz|eligible.{0,20}work",
+     ["Yes", "Yes, I am authorized", "Authorized to work"]),
 
-    # Referral / how did you hear
+    # ── Remote preference ────────────────────────────────────────────────
+    # NOTE: We list many variants; _pick_best_remote_option() handles the
+    # actual option matching at fill-time to avoid hardcoding one string.
+    (r"remote|work.{0,10}(from|preference|location)|plan.{0,10}work.{0,10}remote",
+     "__REMOTE_PICK__"),
+
+    # ── Referral / how did you hear ───────────────────────────────────────
     (r"how.{0,20}hear|referr|source",                    "LinkedIn"),
 
-    # Preferred contact / communication
+    # ── Preferred contact / communication ────────────────────────────────
     (r"preferred.{0,15}contact|best.{0,10}way",          "Email"),
 
-    # Current company / employer
-    (r"current.{0,15}(company|employer)",                "N/A"),
+    # ── Current / previous employer ───────────────────────────────────────
+    (r"current.{0,15}(company|employer)|previous.{0,15}(company|employer)|who is your current",
+     "N/A"),
 
-    # LinkedIn fallback
+    # ── Current / previous job title ─────────────────────────────────────
+    (r"job.?title|current.{0,15}title|previous.{0,15}title",
+     "Software Engineer"),
+
+    # ── Previously employed at THIS company ───────────────────────────────
+    (r"(previously|ever|before).{0,30}(employ|work).{0,30}(stripe|company|us|affiliate)"
+     r"|(employ|work).{0,30}(stripe|company|us|affiliate).{0,30}(previously|before|ever)",
+     ["No", "No, I have not"]),
+
+    # ── Education: school attended ───────────────────────────────────────
+    (r"school|universit|college|institution|attended",
+     "Maharshi Dayanand University"),
+
+    # ── Education: degree obtained ────────────────────────────────────────
+    (r"degree|qualification|highest.{0,15}education",
+     ["Bachelor", "Bachelor's", "B.Tech", "Bachelor of Technology",
+      "Bachelors", "B.E.", "B.Sc", "Undergraduate"]),
+
+    # ── Location / city ──────────────────────────────────────────────────
+    (r"location.{0,15}city|city.{0,15}reside|current.{0,15}city|location \(city\)",
+     "Hyderabad"),
+
+    # ── Country of residence (Stripe custom questions) ────────────────────
+    (r"country.{0,30}(reside|live|located|based)"
+     r"|(reside|live|located|based).{0,30}country"
+     r"|country where you currently",
+     ["India", "India (IN)", "IN"]),
+
+    # ── Countries anticipating working in (checkbox group) ────────────────
+    (r"countr.{0,30}(anticipat|plan|intend).{0,30}work"
+     r"|(anticipat|plan|intend).{0,30}countr.{0,30}work"
+     r"|countr.{0,10}(you|to).{0,10}(work|apply)",
+     ["India", "India (IN)", "IN"]),
+
+    # ── WhatsApp / messaging opt-in ───────────────────────────────────────
+    (r"whatsapp|opt.{0,10}(in|out).{0,20}(message|receiv|sms)"
+     r"|(message|receiv|sms).{0,20}opt.{0,10}(in|out)",
+     ["No", "No, I do not opt-in", "I do not consent"]),
+
+    # ── BrightHire / interview recording consent ──────────────────────────
+    (r"brighthire|record.{0,30}(interview|transcrib)"
+     r"|(interview|transcrib).{0,30}record"
+     r"|consent.{0,20}(record|transcrib|interview)",
+     ["Yes", "I consent", "Yes, I consent"]),
+
+    # ── Generic yes/no ────────────────────────────────────────────────────
+    # (catch-all for employment agreements, non-compete, accommodation)
+    (r"non.?compete|employment.?agreement|reasonable.?accommodation",
+     ["No", "No, I do not"]),
+
+    # ── US city/state (skip if not in US) ────────────────────────────────
+    (r"(city|state).{0,15}(reside|located).{0,15}us"
+     r"|if located in the us",
+     "N/A"),
+
+    # ── LinkedIn fallback ─────────────────────────────────────────────────
     (r"linkedin",                                        "linkedin.com/in/luv-kumar-06975b175"),
 
-    # GitHub fallback
+    # ── GitHub fallback ───────────────────────────────────────────────────
     (r"github",                                          "https://github.com/lovethakur8436"),
 ]
+
+
+# Sentinel value: when SAFE_DEFAULTS returns this, the caller must
+# enumerate the actual dropdown options and pick the best remote choice.
+_REMOTE_SENTINEL = "__REMOTE_PICK__"
+
+# Ordered preference list for remote-preference dropdowns
+_REMOTE_PREFERENCE_KEYWORDS = [
+    "yes", "remote", "open to remote", "open to hybrid", "hybrid",
+    "flexible", "either", "both",
+]
+
+
+def pick_best_remote_option(options: list[str]) -> str | None:
+    """
+    Given the actual dropdown options for a remote-preference question,
+    return the best matching option text.
+    Prefers options containing 'yes', 'remote', 'hybrid', 'open', 'flexible'.
+    Falls back to the first available option.
+    """
+    if not options:
+        return None
+    opts_lower = [(o.lower(), o) for o in options]
+    for kw in _REMOTE_PREFERENCE_KEYWORDS:
+        for ol, o in opts_lower:
+            if kw in ol:
+                return o
+    # Last resort: return first non-empty option
+    return options[0]
 
 
 def get_safe_default(label: str, options: list[str] | None = None) -> str | None:
@@ -93,14 +186,24 @@ def get_safe_default(label: str, options: list[str] | None = None) -> str | None
     Return a safe default answer for a required field whose label matches
     one of the SAFE_DEFAULTS patterns.
 
-    If the default is a list (checkbox group), intersect with available
-    `options` and return the first match; fall back to the first list item.
+    If the default is a list (checkbox group / multi-option), intersect with
+    available `options` and return the first match; fall back to the first
+    list item.
 
     Returns None if no pattern matches.
+    Special sentinel '__REMOTE_PICK__' is returned as-is; callers must
+    call pick_best_remote_option() to resolve it.
     """
     label_lower = (label or "").lower()
     for pattern, default in SAFE_DEFAULTS:
         if re.search(pattern, label_lower):
+            if default == _REMOTE_SENTINEL:
+                if options:
+                    resolved = pick_best_remote_option(options)
+                    if resolved:
+                        return resolved
+                return None  # no options available yet; skip for now
+
             if isinstance(default, list):
                 if options:
                     opts_lower = {o.lower(): o for o in options}
@@ -121,11 +224,78 @@ def get_safe_default(label: str, options: list[str] | None = None) -> str | None
 # Layer 2 — Pre-Submit Empty-Required Field Scan
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Selectors that indicate a validation error has already fired on a field
 _ERROR_FIELD_SELECTORS = (
     ".field_with_errors input, .field_with_errors textarea, "
     "[aria-invalid='true'], "
     "input.error, textarea.error"
+)
+
+# JS is stored as a plain string to avoid Python-triple-quote / JS-backtick
+# conflicts that caused 'SyntaxError: Unexpected end of input' at runtime.
+_SCAN_REQUIRED_JS = (
+    "() => {"
+    "  const skip = new Set(['first_name','last_name','email','phone','country']);"
+    "  const empty = [];"
+    # text / textarea
+    "  document.querySelectorAll("
+    "    'input[type=\"text\"]:not([hidden]), textarea:not([hidden])'"
+    "  ).forEach(function(el) {"
+    "    if (skip.has(el.id)) return;"
+    "    if (el.offsetWidth === 0 && el.offsetHeight === 0) return;"
+    "    var req = el.required"
+    "      || el.getAttribute('aria-required') === 'true'"
+    "      || !!(document.querySelector('label[for=\"' + el.id + '\"]')"
+    "            && document.querySelector('label[for=\"' + el.id + '\"]').innerText.includes('*'));"
+    "    if (!req) return;"
+    "    if ((el.value || '').trim() !== '') return;"
+    "    var lbl = (document.querySelector('label[for=\"' + el.id + '\"]') || {}).innerText || '';"
+    "    lbl = lbl.replace('*','').trim() || el.placeholder || el.name || el.id;"
+    "    empty.push({ id: el.id, name: el.name, label: lbl, type: 'text' });"
+    "  });"
+    # react-select combobox
+    "  document.querySelectorAll('input[role=\"combobox\"]').forEach(function(el) {"
+    "    if (skip.has(el.id)) return;"
+    "    if (el.offsetWidth === 0 && el.offsetHeight === 0) return;"
+    "    var req = el.required"
+    "      || el.getAttribute('aria-required') === 'true'"
+    "      || !!(document.querySelector('label[for=\"' + el.id + '\"]')"
+    "            && document.querySelector('label[for=\"' + el.id + '\"]').innerText.includes('*'));"
+    "    if (!req) return;"
+    "    var control = el.closest('.select__control');"
+    "    if (!control) return;"
+    "    var placeholder = control.querySelector('.select__placeholder');"
+    "    if (!placeholder) return;"
+    "    var lbl = (document.querySelector('label[for=\"' + el.id + '\"]') || {}).innerText || '';"
+    "    lbl = lbl.replace('*','').trim() || el.name || el.id;"
+    "    empty.push({ id: el.id, name: el.name, label: lbl, type: 'react-select' });"
+    "  });"
+    # file input
+    "  document.querySelectorAll('input[type=\"file\"]').forEach(function(el) {"
+    "    if (el.offsetWidth === 0 && el.offsetHeight === 0) return;"
+    "    var req = el.required || el.getAttribute('aria-required') === 'true';"
+    "    if (!req) return;"
+    "    if (el.files && el.files.length > 0) return;"
+    "    empty.push({ id: el.id, name: el.name, label: 'Resume/CV', type: 'file' });"
+    "  });"
+    # checkbox groups
+    "  var groups = {};"
+    "  document.querySelectorAll('input[type=\"checkbox\"]').forEach(function(el) {"
+    "    if (el.offsetWidth === 0 && el.offsetHeight === 0) return;"
+    "    var req = el.required || el.getAttribute('aria-required') === 'true';"
+    "    if (!req) return;"
+    "    var grp = el.name || el.id;"
+    "    if (!groups[grp]) groups[grp] = { any_checked: false, id: el.id, name: grp, label: grp };"
+    "    if (el.checked) groups[grp].any_checked = true;"
+    "    var lbl = (document.querySelector('label[for=\"' + el.id + '\"]') || {}).innerText || '';"
+    "    lbl = lbl.replace('*','').trim();"
+    "    if (lbl && !groups[grp].label_text) groups[grp].label_text = lbl;"
+    "  });"
+    "  Object.values(groups).forEach(function(g) {"
+    "    if (!g.any_checked)"
+    "      empty.push({ id: g.id, name: g.name, label: g.label_text || g.name, type: 'checkbox' });"
+    "  });"
+    "  return empty;"
+    "}"
 )
 
 
@@ -134,75 +304,9 @@ def _scan_required_empty(frame, logs: list) -> list[dict]:
     Walk all visible required fields in `frame`.
     Return a list of dicts describing fields that appear empty so the caller
     can attempt a re-fill before hitting Submit.
-
-    Each dict has: id, name, label, type ('text'|'react-select'|'checkbox'|'file')
     """
     try:
-        return frame.evaluate("""
-        () => {
-            const skip = new Set(['first_name','last_name','email','phone','country']);
-            const empty = [];
-
-            // ── text / textarea ───────────────────────────────────────────
-            document.querySelectorAll(
-                'input[type="text"]:not([hidden]), textarea:not([hidden])'
-            ).forEach(el => {
-                if (skip.has(el.id)) return;
-                if (el.offsetWidth === 0 && el.offsetHeight === 0) return;
-                const req = el.required
-                    || el.getAttribute('aria-required') === 'true'
-                    || !!(document.querySelector(`label[for="${el.id}"]`)?.innerText?.includes('*'));
-                if (!req) return;
-                if ((el.value || '').trim() !== '') return;
-                const label = document.querySelector(`label[for="${el.id}"]`)?.innerText?.replace('*','').trim()
-                    || el.placeholder || el.name || el.id;
-                empty.push({ id: el.id, name: el.name, label, type: 'text' });
-            });
-
-            // ── react-select (combobox) ───────────────────────────────────
-            document.querySelectorAll('input[role="combobox"]').forEach(el => {
-                if (skip.has(el.id)) return;
-                if (el.offsetWidth === 0 && el.offsetHeight === 0) return;
-                const req = el.required
-                    || el.getAttribute('aria-required') === 'true'
-                    || !!(document.querySelector(`label[for="${el.id}"]`)?.innerText?.includes('*'));
-                if (!req) return;
-                const control = el.closest('.select__control');
-                if (!control) return;
-                const placeholder = control.querySelector('.select__placeholder');
-                if (!placeholder) return;  // already has a value
-                const label = document.querySelector(`label[for="${el.id}"]`)?.innerText?.replace('*','').trim()
-                    || el.name || el.id;
-                empty.push({ id: el.id, name: el.name, label, type: 'react-select' });
-            });
-
-            // ── file input (resume) ───────────────────────────────────────
-            document.querySelectorAll('input[type="file"]').forEach(el => {
-                if (el.offsetWidth === 0 && el.offsetHeight === 0) return;
-                const req = el.required || el.getAttribute('aria-required') === 'true';
-                if (!req) return;
-                if (el.files && el.files.length > 0) return;
-                empty.push({ id: el.id, name: el.name, label: 'Resume/CV', type: 'file' });
-            });
-
-            // ── checkbox groups ───────────────────────────────────────────
-            const groups = {};
-            document.querySelectorAll('input[type="checkbox"]').forEach(el => {
-                if (el.offsetWidth === 0 && el.offsetHeight === 0) return;
-                const req = el.required || el.getAttribute('aria-required') === 'true';
-                if (!req) return;
-                const grp = el.name || el.id;
-                if (!groups[grp]) groups[grp] = { any_checked: false, id: el.id, name: grp };
-                if (el.checked) groups[grp].any_checked = true;
-            });
-            Object.values(groups).forEach(g => {
-                if (!g.any_checked)
-                    empty.push({ id: g.id, name: g.name, label: g.name, type: 'checkbox' });
-            });
-
-            return empty;
-        }
-        """)
+        return frame.evaluate(_SCAN_REQUIRED_JS)
     except Exception as exc:
         logs.append(f"[submit_guard] _scan_required_empty error: {exc}")
         return []
@@ -265,7 +369,6 @@ def _wait_outcome(page, frame, pre_url: str, logs: list, wait_s: float = 8) -> s
     """
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
-        # ── URL redirect (Greenhouse often redirects after submit) ──────
         try:
             cur = page.url
             if "/apply" in pre_url.lower() and "/apply" not in cur.lower():
@@ -274,7 +377,6 @@ def _wait_outcome(page, frame, pre_url: str, logs: list, wait_s: float = 8) -> s
         except Exception:
             pass
 
-        # ── Confirmation element ────────────────────────────────────────
         for sel in _CONFIRM_SELECTORS:
             try:
                 if frame.locator(sel).count() > 0:
@@ -283,7 +385,6 @@ def _wait_outcome(page, frame, pre_url: str, logs: list, wait_s: float = 8) -> s
             except Exception:
                 pass
 
-        # ── Validation errors ───────────────────────────────────────────
         errors = _parse_validation_errors(frame, logs)
         blocking = [e for e in errors if "required" in e.lower() or "invalid" in e.lower() or len(e) > 3]
         if blocking:
@@ -304,24 +405,16 @@ def submit_with_retry(
     candidate_profile: dict,
     logs: list,
     *,
-    refill_fn,          # callable(frame, field_info, answer, logs, page)
+    refill_fn,
     resume_path: str | None = None,
 ) -> str:
     """
     Click Submit, detect validation errors, re-fill highlighted fields,
     and retry up to MAX_SUBMIT_RETRIES times.
-
-    `refill_fn` is a callback with signature:
-        refill_fn(frame, field_info: dict, answer: str, logs: list, page: Page)
-    It should call the appropriate fill helper (_fill_react_select, frame.fill, etc.)
-    and is supplied by greenhouse.py to avoid circular imports.
-
-    Returns the final outcome string: 'AUTO_APPLIED' | 'VALIDATION_FAILED' | 'FAILED'
     """
     submit_btn_sel = "input#submit_app, button#submit_app, button[type='submit']"
 
-    for attempt in range(1, MAX_SUBMIT_RETRIES + 2):  # 1, 2, 3 — first is the real submit
-        # ── Layer 2: pre-submit scan on every attempt ───────────────────
+    for attempt in range(1, MAX_SUBMIT_RETRIES + 2):
         if attempt > 1:
             logs.append(f"[submit_guard] Pre-submit scan (attempt {attempt})...")
 
@@ -334,29 +427,46 @@ def submit_with_retry(
             for ef in empty_fields:
                 ftype = ef.get("type")
 
-                # Resume re-upload
                 if ftype == "file" and resume_path:
                     try:
                         frame.locator("input[type='file']").first.set_input_files(resume_path)
-                        logs.append(f"[submit_guard] Re-uploaded resume for empty file field")
+                        logs.append("[submit_guard] Re-uploaded resume for empty file field")
                     except Exception as exc:
                         logs.append(f"[submit_guard] Resume re-upload failed: {exc}")
                     continue
 
-                # Look up a safe default for this field
                 field_info = next(
                     (q for q in questions_data
                      if q.get("id") == ef["id"] or q.get("name") == ef["name"]),
-                    ef  # fallback: use the empty-field descriptor itself
+                    ef
                 )
+
+                # For remote question: enumerate live options before calling get_safe_default
                 opts = field_info.get("options") if isinstance(field_info.get("options"), list) else None
-                # For checkbox groups options is a list of dicts; extract labels
-                opt_labels = None
+                opt_labels: list[str] | None = None
                 if opts:
-                    if opts and isinstance(opts[0], dict):
+                    if isinstance(opts[0], dict):
                         opt_labels = [o.get("label", "") for o in opts]
                     else:
-                        opt_labels = opts
+                        opt_labels = list(opts)
+
+                # If remote sentinel and no options cached, try to scrape them live
+                label_lower = (ef.get("label") or "").lower()
+                is_remote_field = bool(re.search(
+                    r"remote|work.{0,10}(from|preference|location)|plan.{0,10}work.{0,10}remote",
+                    label_lower
+                ))
+                if is_remote_field and not opt_labels and ef.get("type") == "react-select":
+                    try:
+                        from app.apply_agent.greenhouse import _get_react_select_options
+                        live_opts = _get_react_select_options(frame, ef["id"], page=page)
+                        if live_opts:
+                            opt_labels = live_opts
+                            logs.append(
+                                f"[submit_guard] Scraped remote options live for '{ef['id']}': {live_opts}"
+                            )
+                    except Exception as scrape_err:
+                        logs.append(f"[submit_guard] Live option scrape failed: {scrape_err}")
 
                 default = get_safe_default(ef["label"], opt_labels)
                 if default:
@@ -374,7 +484,6 @@ def submit_with_retry(
                         f"(id={ef['id']}) — leaving blank"
                     )
 
-        # ── Click Submit ────────────────────────────────────────────────
         try:
             btn = frame.locator(submit_btn_sel)
             if btn.count() == 0:
@@ -397,10 +506,8 @@ def submit_with_retry(
                 f"[submit_guard] Retry {attempt}/{MAX_SUBMIT_RETRIES}: "
                 f"validation errors = {errors}"
             )
-            # Map error messages back to field IDs for targeted re-fill
             for err_text in errors:
                 err_lower = err_text.lower()
-                # Find the field whose label is most mentioned in the error
                 matched_field = None
                 for q in questions_data:
                     lbl = (q.get("label") or "").lower()
@@ -414,23 +521,35 @@ def submit_with_retry(
                 if opts and isinstance(opts[0], dict):
                     opt_labels = [o.get("label", "") for o in opts]
                 elif opts:
-                    opt_labels = opts
+                    opt_labels = list(opts)
+
+                # scrape live remote options on retry too
+                is_remote = bool(re.search(
+                    r"remote|work.{0,10}(from|preference|location)|plan.{0,10}work.{0,10}remote",
+                    (matched_field.get("label") or "").lower()
+                ))
+                if is_remote and not opt_labels and matched_field.get("type") == "react-select":
+                    try:
+                        from app.apply_agent.greenhouse import _get_react_select_options
+                        live_opts = _get_react_select_options(frame, matched_field["id"], page=page)
+                        if live_opts:
+                            opt_labels = live_opts
+                    except Exception:
+                        pass
+
                 default = get_safe_default(matched_field.get("label", ""), opt_labels)
                 if default:
                     logs.append(
-                        f"[submit_guard] Retry re-fill '{matched_field['label']}' "
-                        f"-> '{default}'"
+                        f"[submit_guard] Retry re-fill '{matched_field['label']}' -> '{default}'"
                     )
                     try:
                         refill_fn(frame, matched_field, default, logs, page)
                     except Exception as exc:
                         logs.append(f"[submit_guard] Retry refill error: {exc}")
             frame.wait_for_timeout(800)
-            continue  # next attempt
+            continue
 
-        # FAILED or exhausted retries
         return outcome
 
-    # Exhausted all retries
     logs.append(f"[submit_guard] All {MAX_SUBMIT_RETRIES} retries exhausted — marking VALIDATION_FAILED")
     return "VALIDATION_FAILED"
