@@ -1,6 +1,11 @@
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 from app.apply_agent.base import BaseApplyAgent
 from app.apply_agent.form_resolver import resolve_apply_form, get_form_frame
+from app.apply_agent.submit_guard import (
+    get_safe_default,
+    _scan_required_empty,
+    submit_with_retry,
+)
 from app.models.application import Application
 import json
 import os
@@ -12,11 +17,6 @@ _MAX_OPTIONS_FOR_LLM = 40
 
 
 def _safe_css_id(field_id: str) -> str:
-    """
-    Return a safe Playwright attribute selector for a field ID.
-    CSS shorthand  input#foo[]  is invalid when the ID contains brackets.
-    Using [id='foo[]'] is always safe regardless of special characters.
-    """
     return f"[id='{field_id}']"
 
 
@@ -25,17 +25,6 @@ def _safe_css_id(field_id: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _resolve_resume_path(application: Application, logs: list) -> str | None:
-    """
-    Return the best available resume PDF path for this application.
-
-    Priority:
-      1. application.tailored_resume_pdf_path   (job-specific tailored PDF)
-      2. data/base_resume.pdf                   (generic base resume fallback)
-      3. First match of data/resume_*.pdf glob  (any previously compiled resume)
-
-    Returns None if nothing is found — caller logs a warning and skips upload.
-    """
-    # 1. Tailored PDF
     tailored = getattr(application, 'tailored_resume_pdf_path', None)
     if tailored and os.path.exists(tailored):
         logs.append(f"Resume: using tailored PDF '{tailored}'")
@@ -43,18 +32,14 @@ def _resolve_resume_path(application: Application, logs: list) -> str | None:
     if tailored:
         logs.append(f"Resume: tailored path '{tailored}' does not exist — trying fallbacks")
 
-    # 2. Base resume
     base = "data/base_resume.pdf"
     if os.path.exists(base):
         logs.append(f"Resume: tailored PDF missing, falling back to base resume '{base}'")
         return base
 
-    # 3. Any compiled resume in data/
     candidates = sorted(glob.glob("data/resume_*.pdf"), key=os.path.getmtime, reverse=True)
     if candidates:
-        logs.append(
-            f"Resume: no base resume found, using most-recent compiled PDF '{candidates[0]}'"
-        )
+        logs.append(f"Resume: no base resume found, using most-recent compiled PDF '{candidates[0]}'")
         return candidates[0]
 
     logs.append(
@@ -90,13 +75,11 @@ def _get_react_select_options(frame, field_id: str, page: Page = None) -> list[s
         except Exception:
             pass
 
-    # Frame has no .keyboard — always use the root Page object
     try:
         kb = page.keyboard if page is not None else None
         if kb:
             kb.press("Escape")
         else:
-            # Fallback: click somewhere neutral to close the dropdown
             frame.locator("body").click(position={"x": 5, "y": 5}, timeout=1000)
     except Exception:
         pass
@@ -134,7 +117,6 @@ def _get_react_select_options_typeahead(frame, field_id: str, search_term: str, 
         except Exception:
             pass
 
-    # Frame has no .keyboard — always use the root Page object
     try:
         kb = page.keyboard if page is not None else None
         if kb:
@@ -148,14 +130,8 @@ def _get_react_select_options_typeahead(frame, field_id: str, search_term: str, 
 
 
 def _fill_react_select(frame, field_id: str, answer_text: str, logs: list, page: Page = None) -> bool:
-    """
-    Fill a react-select dropdown.
-    - Uses safe attribute selectors to avoid CSS crash on IDs containing [].
-    - Skips entirely when answer_text is empty/null.
-    - Uses page.keyboard (not frame.keyboard) for Escape presses.
-    """
     if not answer_text or not answer_text.strip():
-        logs.append(f"react-select: skipping '{field_id}' — LLM returned empty answer, leaving blank")
+        logs.append(f"react-select: skipping '{field_id}' — empty answer, leaving blank")
         return False
 
     control_div = frame.locator(
@@ -344,65 +320,49 @@ def _call_llm_with_fallback(prompt: str, logs: list) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Submit helpers
+# Universal field refill callback (used by submit_with_retry)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_CONFIRMATION_SELECTORS = [
-    "[class*='confirmation']:visible",
-    "[class*='success']:visible",
-    "[class*='thank']:visible",
-    "h1:has-text('Thank you'):visible",
-    "h2:has-text('Thank you'):visible",
-    "h1:has-text('Application submitted'):visible",
-    "p:has-text('Application received'):visible",
-    "p:has-text('successfully submitted'):visible",
-]
+def _refill_field(frame, field_info: dict, answer: str, logs: list, page: Page):
+    """
+    Thin dispatcher: fill `field_info` with `answer` using the correct
+    strategy (react-select / checkbox / text). Used as the `refill_fn`
+    callback passed to submit_with_retry.
+    """
+    ftype = field_info.get("type", "text")
+    fid   = field_info.get("id", "")
+    fname = field_info.get("name", "")
 
-_POST_SUBMIT_ERROR_SELECTORS = [
-    ".error-message:visible",
-    ".field_with_errors:visible",
-    "[class*='error']:visible",
-    "[class*='invalid']:visible",
-    "[aria-invalid='true']:visible",
-]
+    if ftype == "react-select":
+        _fill_react_select(frame, fid, answer, logs, page=page)
 
+    elif ftype == "checkbox":
+        opts = field_info.get("options", [])
+        # answer may be a label string or an id string
+        target = next(
+            (o["id"] for o in opts
+             if answer.lower() in (o.get("label", "") + o.get("id", "")).lower()),
+            None
+        )
+        if target:
+            try:
+                frame.locator(f"[id='{target}']").check(force=True, timeout=5000)
+                logs.append(f"[refill] Checked checkbox '{target}'")
+            except Exception as e:
+                logs.append(f"[refill] Checkbox check failed '{target}': {e}")
+        else:
+            logs.append(f"[refill] Checkbox: no match for '{answer}' in {opts}")
 
-def _wait_for_submit_outcome(page_or_frame, pre_submit_url: str, logs: list) -> str:
-    import time
-    deadline = time.monotonic() + 8
-    poll_ms = 600
-
-    while time.monotonic() < deadline:
+    else:
+        sel = f"[id='{fid}']" if fid else f"[name='{fname}']"
         try:
-            current_url = page_or_frame.url
-            if "/apply" in pre_submit_url.lower() and "/apply" not in current_url.lower():
-                logs.append(f"Submit confirmed: URL changed to '{current_url}'")
-                return "AUTO_APPLIED"
-        except Exception:
-            pass
-
-        for sel in _CONFIRMATION_SELECTORS:
-            try:
-                if page_or_frame.locator(sel).count() > 0:
-                    logs.append(f"Submit confirmed: found confirmation element '{sel}'")
-                    return "AUTO_APPLIED"
-            except Exception:
-                pass
-
-        for sel in _POST_SUBMIT_ERROR_SELECTORS:
-            try:
-                els = page_or_frame.locator(sel).all_inner_texts()
-                blocking = [e.strip() for e in els if e.strip() and "required" in e.lower()]
-                if blocking:
-                    logs.append(f"Submit validation errors detected: {blocking}")
-                    return "VALIDATION_FAILED"
-            except Exception:
-                pass
-
-        page_or_frame.wait_for_timeout(poll_ms)
-
-    logs.append("Submit outcome: no confirmation or error detected after 8s — marking FAILED")
-    return "FAILED"
+            frame.locator(sel).fill(answer, timeout=5000)
+            frame.locator(sel).evaluate(
+                "el => el.dispatchEvent(new Event('blur', { bubbles: true }))"
+            )
+            logs.append(f"[refill] Filled text field '{fid}' = '{answer}'")
+        except Exception as e:
+            logs.append(f"[refill] Text fill failed '{fid}': {e}")
 
 
 class GreenhouseApplyAgent(BaseApplyAgent):
@@ -425,7 +385,6 @@ class GreenhouseApplyAgent(BaseApplyAgent):
         if is_iframe_embed:
             result["logs"].append("Form is inside an iframe — switching to iframe frame context")
 
-        # Work inside the frame that actually contains the form
         frame = get_form_frame(page, is_iframe_embed)
 
         try:
@@ -439,6 +398,7 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                 "el => el.dispatchEvent(new Event('blur', { bubbles: true }))"
             )
 
+        # ── Core fields ────────────────────────────────────────────────────
         try:
             fill_and_blur("input#first_name", candidate_profile.get("first_name", ""))
             fill_and_blur("input#last_name",  candidate_profile.get("last_name",  ""))
@@ -450,7 +410,6 @@ class GreenhouseApplyAgent(BaseApplyAgent):
 
         country_from_profile = candidate_profile.get("country", "India")
         result["logs"].append(f"Setting phone country selector to '{country_from_profile}'")
-        # Pass root `page` for keyboard access — Frame has no .keyboard
         ok = _fill_react_select(frame, "country", country_from_profile, result["logs"], page=page)
         if not ok:
             result["logs"].append("WARNING: country selector failed")
@@ -464,7 +423,7 @@ class GreenhouseApplyAgent(BaseApplyAgent):
             result["logs"].append(f"WARNING: phone fill failed: {e}")
         frame.wait_for_timeout(500)
 
-        # ── Resume upload with fallback resolution ──────────────────────────
+        # ── Resume upload ──────────────────────────────────────────────────
         resume_path = _resolve_resume_path(application, result["logs"])
         if resume_path:
             try:
@@ -481,8 +440,9 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                 frame.wait_for_timeout(1000)
             except Exception as e:
                 result["logs"].append(f"Resume upload failed: {e}")
-        # If resume_path is None, _resolve_resume_path already logged the warning
 
+        # ── Custom questions ───────────────────────────────────────────────
+        questions_data: list[dict] = []
         try:
             questions_data = frame.evaluate("""() => {
                 const fields = [];
@@ -529,7 +489,7 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                     fields.push(fi);
                 });
                 return fields;
-            }""")
+            """)
 
             if not questions_data:
                 questions_data = []
@@ -540,7 +500,6 @@ class GreenhouseApplyAgent(BaseApplyAgent):
 
             for field in questions_data:
                 if field.get("type") == "react-select":
-                    # Pass root `page` to avoid Frame.keyboard crash
                     real_opts = _get_react_select_options(frame, field["id"], page=page)
                     if not real_opts:
                         hint = TYPEAHEAD_FIELD_HINTS.get(
@@ -557,7 +516,8 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                                 )
                     field["options"] = real_opts
                     result["logs"].append(
-                        f"Scraped options for {field['id']}: {real_opts[:5]}{'...' if len(real_opts) > 5 else ''} ({len(real_opts)} total)"
+                        f"Scraped options for {field['id']}: {real_opts[:5]}"
+                        f"{'...' if len(real_opts) > 5 else ''} ({len(real_opts)} total)"
                     )
 
             pre_resolved: dict[str, str] = {}
@@ -632,9 +592,36 @@ Return a flat JSON object: keys = field `id`, values = the answer string (or omi
             for field_id, answer_val in answers.items():
                 if not field_id:
                     continue
+
+                # ── NULL / EMPTY ANSWER: try SAFE_DEFAULTS before skipping ──
                 if answer_val is None or str(answer_val).strip() == "":
-                    result["logs"].append(f"Skipping '{field_id}' — LLM returned null/empty answer")
-                    continue
+                    field_info = next(
+                        (f for f in questions_data if f["id"] == field_id or f["name"] == field_id),
+                        None
+                    )
+                    if field_info and field_info.get("required"):
+                        opts = field_info.get("options", [])
+                        opt_labels = (
+                            [o.get("label", "") for o in opts]
+                            if opts and isinstance(opts[0], dict)
+                            else opts
+                        )
+                        safe = get_safe_default(field_info.get("label", ""), opt_labels)
+                        if safe:
+                            result["logs"].append(
+                                f"LLM null for required '{field_id}' ('{field_info['label']}') "
+                                f"— applying safe default: '{safe}'"
+                            )
+                            answer_val = safe
+                        else:
+                            result["logs"].append(
+                                f"Skipping required '{field_id}' — LLM null, no safe default"
+                            )
+                            continue
+                    else:
+                        result["logs"].append(f"Skipping optional '{field_id}' — LLM returned null")
+                        continue
+
                 try:
                     field_info = next(
                         (f for f in questions_data if f["id"] == field_id or f["name"] == field_id),
@@ -658,8 +645,12 @@ Return a flat JSON object: keys = field `id`, values = the answer string (or omi
                             result["logs"].append(f"WARNING: react-select failed for {field_id} = '{answer_val}'")
                             if not field_info.get("options"):
                                 try:
-                                    frame.locator(f"input{_safe_css_id(field_info['id'])}").fill(str(answer_val), timeout=3000)
-                                    result["logs"].append(f"Typeahead plain-fill fallback: {field_id} = '{answer_val}'")
+                                    frame.locator(f"input{_safe_css_id(field_info['id'])}").fill(
+                                        str(answer_val), timeout=3000
+                                    )
+                                    result["logs"].append(
+                                        f"Typeahead plain-fill fallback: {field_id} = '{answer_val}'"
+                                    )
                                 except Exception:
                                     pass
 
@@ -670,20 +661,27 @@ Return a flat JSON object: keys = field `id`, values = the answer string (or omi
                         for target_id in target_ids:
                             if target_id not in valid_ids and opts:
                                 matched_opt = next(
-                                    (o for o in opts if target_id.lower() in o.get("label", "").lower()),
+                                    (o for o in opts
+                                     if target_id.lower() in o.get("label", "").lower()),
                                     None
                                 )
                                 if matched_opt:
                                     target_id = matched_opt["id"]
-                                    result["logs"].append(f"Checkbox: label-matched id -> '{target_id}'")
+                                    result["logs"].append(
+                                        f"Checkbox: label-matched id -> '{target_id}'"
+                                    )
                                 else:
-                                    result["logs"].append(f"Checkbox: skipping invalid id '{target_id}'")
+                                    result["logs"].append(
+                                        f"Checkbox: skipping invalid id '{target_id}'"
+                                    )
                                     continue
                             try:
                                 frame.locator(f"[id='{target_id}']").check(force=True, timeout=5000)
                                 result["logs"].append(f"Checked checkbox '{target_id}'")
                             except Exception as e:
-                                result["logs"].append(f"Checkbox check failed for '{target_id}': {e}")
+                                result["logs"].append(
+                                    f"Checkbox check failed for '{target_id}': {e}"
+                                )
 
                     elif ftype == "radio":
                         el = frame.locator(f"[id='{answer_val}']")
@@ -711,45 +709,32 @@ Return a flat JSON object: keys = field `id`, values = the answer string (or omi
         frame.wait_for_timeout(1500)
 
         try:
-            page.screenshot(path=f"data/debug_before_submit_{application.id}.png", full_page=True)
-            result["logs"].append(f"Debug screenshot saved.")
+            page.screenshot(
+                path=f"data/debug_before_submit_{application.id}.png", full_page=True
+            )
+            result["logs"].append("Debug screenshot saved.")
         except Exception:
             pass
 
-        # Pre-submit validation check
-        try:
-            raw_errors = frame.locator(
-                ".field_with_errors, [class*='error']:visible, [class*='invalid']:visible, [aria-invalid='true']:visible"
-            ).all_inner_texts()
-            blocking = [e.strip() for e in raw_errors if e.strip() and "required" in e.lower()]
-            if blocking:
-                result["logs"].append(f"BLOCKED SUBMIT - validation errors: {blocking}")
-                result["status"] = "VALIDATION_FAILED"
-                return
-        except Exception:
-            pass
-
-        frame.wait_for_timeout(500)
+        # ── Submit with retry (Layers 2 + 3) ──────────────────────────────
         pre_submit_url = page.url
+        outcome = submit_with_retry(
+            page=page,
+            frame=frame,
+            pre_submit_url=pre_submit_url,
+            questions_data=questions_data,
+            candidate_profile=candidate_profile,
+            logs=result["logs"],
+            refill_fn=_refill_field,
+            resume_path=resume_path,
+        )
+        result["status"] = outcome
 
-        try:
-            submit_btn = frame.locator("input#submit_app, button#submit_app, button[type='submit']")
-            if submit_btn.count() > 0:
-                submit_btn.first.click()
-                result["logs"].append("Submit clicked.")
-
-                outcome = _wait_for_submit_outcome(page, pre_submit_url, result["logs"])
-                result["status"] = outcome
-
-                if outcome == "AUTO_APPLIED":
-                    try:
-                        page.screenshot(path=f"data/success_{application.id}.png")
-                        result["logs"].append(f"Success screenshot: data/success_{application.id}.png")
-                    except Exception:
-                        pass
-            else:
-                result["logs"].append("Submit button not found.")
-                result["status"] = "FAILED"
-        except Exception as e:
-            result["logs"].append(f"Submit error: {e}")
-            result["status"] = "FAILED"
+        if outcome == "AUTO_APPLIED":
+            try:
+                page.screenshot(path=f"data/success_{application.id}.png")
+                result["logs"].append(
+                    f"Success screenshot: data/success_{application.id}.png"
+                )
+            except Exception:
+                pass
