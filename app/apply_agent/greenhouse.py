@@ -369,8 +369,10 @@ def _call_llm_with_fallback(prompt: str, logs: list) -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JS for scraping custom questions
-# Stored as a plain concatenated string to avoid Python triple-quote /
-# JS backtick conflicts that caused 'SyntaxError: Unexpected end of input'.
+# FIX: checkbox/radio groups now also capture the GROUP-LEVEL question label
+# from the nearest <legend> or parent container label, so the LLM sees the
+# real question text (e.g. "countries you anticipate working in") instead of
+# the first option's own label (e.g. "Australia").
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SCRAPE_QUESTIONS_JS = (
@@ -384,6 +386,17 @@ _SCRAPE_QUESTIONS_JS = (
     "    + 'input[type=\"checkbox\"]:not([hidden]),'"
     "    + 'input[type=\"radio\"]:not([hidden])'"
     "  );"
+    "  function getGroupLabel(el) {"
+    "    var container = el.closest('fieldset, div.field-wrapper, div.field, div.custom_question');"
+    "    if (!container) return '';"
+    "    var leg = container.querySelector('legend');"
+    "    if (leg) return leg.innerText.replace('*','').trim();"
+    "    var lbl = container.querySelector('label:not([for])');"
+    "    if (lbl) return lbl.innerText.replace('*','').trim();"
+    "    var heading = container.querySelector('span.label, p.label, div.label, .question-label');"
+    "    if (heading) return heading.innerText.replace('*','').trim();"
+    "    return '';"
+    "  }"
     "  els.forEach(function(el) {"
     "    if (skip.has(el.id)) return;"
     "    if ((el.className || '').includes('recaptcha')) return;"
@@ -391,25 +404,35 @@ _SCRAPE_QUESTIONS_JS = (
     "    if (el.offsetWidth === 0 && el.offsetHeight === 0) return;"
     "    var container = el.closest('div.field-wrapper, div.field, div.custom_question');"
     "    var labelEl = document.querySelector('label[for=\"' + el.id + '\"]')"
-    "                || (container && container.querySelector('label'));"
-    "    var label = labelEl ? labelEl.innerText.replace('*','').trim() : (el.name || el.id);"
+    "                || (container && container.querySelector('label[for=\"' + el.id + '\"]'));"
+    "    var optionLabel = labelEl ? labelEl.innerText.replace('*','').trim() : (el.name || el.id);"
     "    var isRequired = el.required"
     "      || el.getAttribute('aria-required') === 'true'"
     "      || !!(labelEl && labelEl.innerText.includes('*'));"
-    "    var fi = { id: el.id, name: el.name || '', label: label, required: isRequired };"
+    "    var fi = { id: el.id, name: el.name || '', label: optionLabel, required: isRequired };"
     "    if (el.getAttribute('role') === 'combobox') {"
     "      fi.type = 'react-select';"
     "      fi.options = [];"
     "    } else if (el.type === 'checkbox') {"
     "      fi.type = 'checkbox';"
     "      var ex = fields.find(function(f) { return f.name === fi.name && f.type === 'checkbox'; });"
-    "      if (ex) { ex.options.push({ value: el.value, id: el.id, label: label }); return; }"
-    "      fi.options = [{ value: el.value, id: el.id, label: label }];"
+    "      if (ex) {"
+    "        ex.options.push({ value: el.value, id: el.id, label: optionLabel });"
+    "        return;"
+    "      }"
+    "      var grpLabel = getGroupLabel(el);"
+    "      fi.label = grpLabel || optionLabel;"
+    "      fi.options = [{ value: el.value, id: el.id, label: optionLabel }];"
     "    } else if (el.type === 'radio') {"
     "      fi.type = 'radio';"
     "      var ex2 = fields.find(function(f) { return f.name === fi.name && f.type === 'radio'; });"
-    "      if (ex2) { ex2.options.push({ value: el.value, id: el.id, label: label }); return; }"
-    "      fi.options = [{ value: el.value, id: el.id, label: label }];"
+    "      if (ex2) {"
+    "        ex2.options.push({ value: el.value, id: el.id, label: optionLabel });"
+    "        return;"
+    "      }"
+    "      var grpLabel2 = getGroupLabel(el);"
+    "      fi.label = grpLabel2 || optionLabel;"
+    "      fi.options = [{ value: el.value, id: el.id, label: optionLabel }];"
     "    } else {"
     "      fi.type = 'text';"
     "    }"
@@ -418,6 +441,73 @@ _SCRAPE_QUESTIONS_JS = (
     "  return fields;"
     "}"
 )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Checkbox fill helper
+# FIX: answer_val from LLM is a LABEL string (e.g. "India"), not a DOM id.
+# Try label-match first, then fall back to treating it as a literal id.
+# Supports comma-separated values for multi-select checkbox groups.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fill_checkbox_group(
+    frame, field_info: dict, answer_val: str, logs: list
+) -> None:
+    """
+    Fill a checkbox group field.
+    `answer_val` may be:
+      - A comma-separated list of LABELS  (e.g. "India")  <- LLM default
+      - A comma-separated list of DOM IDs (e.g. "question_60419387[]_1234")
+    We try both strategies so either format works.
+    """
+    raw_tokens = [s.strip() for s in str(answer_val).split(",") if s.strip()]
+    opts = field_info.get("options", [])
+    valid_ids = {o.get("id") for o in opts if o.get("id")}
+
+    for token in raw_tokens:
+        target_id: str | None = None
+
+        # 1. Exact DOM-id match
+        if token in valid_ids:
+            target_id = token
+            logs.append(f"Checkbox: exact id match '{token}'")
+        else:
+            # 2. Label exact match (case-insensitive)
+            matched = next(
+                (o for o in opts if o.get("label", "").lower() == token.lower()),
+                None,
+            )
+            if matched:
+                target_id = matched["id"]
+                logs.append(
+                    f"Checkbox: label-exact matched '{token}' -> id '{target_id}'"
+                )
+            else:
+                # 3. Label partial / contains match
+                matched = next(
+                    (
+                        o for o in opts
+                        if token.lower() in o.get("label", "").lower()
+                        or o.get("label", "").lower() in token.lower()
+                    ),
+                    None,
+                )
+                if matched:
+                    target_id = matched["id"]
+                    logs.append(
+                        f"Checkbox: label-partial matched '{token}' -> id '{target_id}'"
+                    )
+                else:
+                    logs.append(
+                        f"Checkbox: no match for token '{token}' in opts {[o.get('label') for o in opts]}"
+                    )
+                    continue
+
+        try:
+            frame.locator(f"[id='{target_id}']").check(force=True, timeout=5000)
+            logs.append(f"Checked checkbox '{target_id}'")
+        except Exception as e:
+            logs.append(f"Checkbox check failed for '{target_id}': {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -435,7 +525,6 @@ def _refill_field(frame, field_info: dict, answer: str, logs: list, page: Page):
     fname = field_info.get("name", "")
 
     if ftype == "react-select":
-        # For remote-preference fields, use the dedicated remote handler
         label_lower = (field_info.get("label") or "").lower()
         is_remote = bool(re.search(
             r"remote|work.{0,10}(from|preference|location)|plan.{0,10}work.{0,10}remote",
@@ -447,23 +536,8 @@ def _refill_field(frame, field_info: dict, answer: str, logs: list, page: Page):
             _fill_react_select(frame, fid, answer, logs, page=page)
 
     elif ftype == "checkbox":
-        opts = field_info.get("options", [])
-        target = next(
-            (
-                o["id"]
-                for o in opts
-                if answer.lower() in (o.get("label", "") + o.get("id", "")).lower()
-            ),
-            None,
-        )
-        if target:
-            try:
-                frame.locator(f"[id='{target}']").check(force=True, timeout=5000)
-                logs.append(f"[refill] Checked checkbox '{target}'")
-            except Exception as e:
-                logs.append(f"[refill] Checkbox check failed '{target}': {e}")
-        else:
-            logs.append(f"[refill] Checkbox: no match for '{answer}' in {opts}")
+        # Use the unified helper which handles both label and id tokens
+        _fill_checkbox_group(frame, field_info, answer, logs)
 
     else:
         sel = f"[id='{fid}']" if fid else f"[name='{fname}']"
@@ -576,15 +650,12 @@ class GreenhouseApplyAgent(BaseApplyAgent):
         # ── Custom questions ───────────────────────────────────────────────
         questions_data: list[dict] = []
         try:
-            # Use pre-built JS string (no triple-quote / backtick interpolation)
             questions_data = frame.evaluate(_SCRAPE_QUESTIONS_JS)
 
             if not questions_data:
                 questions_data = []
 
-            # candidate-location is a typeahead — fill directly instead of
-            # trying to match it as a normal react-select dropdown, which
-            # previously produced zero options and left the field blank.
+            # candidate-location is a typeahead — fill directly
             DIRECT_FILL_FIELDS: dict[str, str] = {
                 "candidate-location": candidate_profile.get("location", "Hyderabad"),
             }
@@ -598,7 +669,6 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                             "el => el.dispatchEvent(new Event('input', { bubbles: true }))"
                         )
                         frame.wait_for_timeout(600)
-                        # Pick the first autocomplete suggestion if any appear
                         suggestion = frame.locator(
                             f"div[role='option']:visible, "
                             f"[id^='react-select-{field_id}-option']:visible"
@@ -615,7 +685,6 @@ class GreenhouseApplyAgent(BaseApplyAgent):
                             result["logs"].append(
                                 f"Direct-fill '{field_id}' = '{fill_value}' (no suggestion, blurred)"
                             )
-                        # Remove from LLM questions to avoid duplicate filling
                         questions_data = [
                             q for q in questions_data if q.get("id") != field_id
                         ]
@@ -702,7 +771,7 @@ INSTRUCTIONS:
 8. "How did you hear" -> "LinkedIn".
 9. WhatsApp opt-in / messaging consent -> prefer 'No' or 'I do not consent' options.
 10. Interview recording consent (BrightHire etc.) -> prefer 'Yes' or 'I consent' — required to proceed.
-11. Country where you currently reside -> "India".
+11. Country where you currently reside -> select 'India' from the available options.
 12. Work authorization -> "Yes" (candidate is authorized to work in India).
 13. Previously employed at this company -> "No".
 14. Current/previous job title -> "Software Engineer".
@@ -711,6 +780,12 @@ INSTRUCTIONS:
 17. OPTIONAL FIELDS: If a field is optional and you have no clear answer, omit the key entirely
     or return null — do NOT return an empty string "". Returning "" will silently pick
     the first available option, which is almost always wrong.
+18. CHECKBOX GROUPS (type=checkbox): The `options` array lists all available checkboxes with
+    their `label` and `id`. Return the LABEL string of the option(s) to check, NOT the DOM id.
+    For multi-select groups (e.g. "countries you anticipate working in"), return a
+    comma-separated string of LABELS matching the candidate's situation.
+    Example: for "countries you anticipate working in" -> return "India".
+    Example: for "areas of specialization" -> return "Backend,Full-Stack".
 
 CRITICAL RULE FOR react-select FIELDS:
 - The `options` list contains the EXACT visible text of every choice available in that dropdown.
@@ -721,10 +796,6 @@ CRITICAL RULE FOR react-select FIELDS:
 - For veteran: pick the option that means 'not a veteran'.
 - For skill level scales (e.g. ['Poor', 'Fair', 'Average', 'Good', 'Excellent']): pick an appropriate level.
 - For remote preference: pick the option closest to 'Yes / Open to remote or hybrid'.
-- For multi-select checkbox-style questions, return a comma-separated string of the matching option IDs.
-
-CRITICAL RULE FOR checkbox FIELDS:
-- Return the `id` of the checkbox option to check (from the options array).
 
 CRITICAL RULE FOR radio FIELDS:
 - Return the `id` of the radio button to select (from the options array).
@@ -732,7 +803,7 @@ CRITICAL RULE FOR radio FIELDS:
 Form Fields:
 {json.dumps(llm_questions, indent=2)}
 
-Return a flat JSON object: keys = field `id`, values = the answer string (or omit key if no clear answer).
+Return a flat JSON object: keys = field `id` (use the top-level `id` for the group), values = the answer string (or omit key if no clear answer).
 """
 
             answers = _call_llm_with_fallback(prompt, result["logs"])
@@ -836,43 +907,10 @@ Return a flat JSON object: keys = field `id`, values = the answer string (or omi
                                     pass
 
                     elif ftype == "checkbox":
-                        target_ids = [
-                            s.strip() for s in str(answer_val).split(",") if s.strip()
-                        ]
-                        opts = field_info.get("options", [])
-                        valid_ids = {o.get("id") for o in opts}
-                        for target_id in target_ids:
-                            if target_id not in valid_ids and opts:
-                                matched_opt = next(
-                                    (
-                                        o
-                                        for o in opts
-                                        if target_id.lower()
-                                        in o.get("label", "").lower()
-                                    ),
-                                    None,
-                                )
-                                if matched_opt:
-                                    target_id = matched_opt["id"]
-                                    result["logs"].append(
-                                        f"Checkbox: label-matched id -> '{target_id}'"
-                                    )
-                                else:
-                                    result["logs"].append(
-                                        f"Checkbox: skipping invalid id '{target_id}'"
-                                    )
-                                    continue
-                            try:
-                                frame.locator(f"[id='{target_id}']").check(
-                                    force=True, timeout=5000
-                                )
-                                result["logs"].append(
-                                    f"Checked checkbox '{target_id}'"
-                                )
-                            except Exception as e:
-                                result["logs"].append(
-                                    f"Checkbox check failed for '{target_id}': {e}"
-                                )
+                        # Unified helper handles both label strings and DOM ids
+                        _fill_checkbox_group(
+                            frame, field_info, str(answer_val), result["logs"]
+                        )
 
                     elif ftype == "radio":
                         el = frame.locator(f"[id='{answer_val}']")
