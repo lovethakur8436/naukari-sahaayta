@@ -74,8 +74,6 @@ SAFE_DEFAULTS: list[tuple[str, str | list]] = [
      ["Yes", "Yes, I am authorized", "Authorized to work"]),
 
     # ── Remote preference ────────────────────────────────────────────────
-    # NOTE: We list many variants; _pick_best_remote_option() handles the
-    # actual option matching at fill-time to avoid hardcoding one string.
     (r"remote|work.{0,10}(from|preference|location)|plan.{0,10}work.{0,10}remote",
      "__REMOTE_PICK__"),
 
@@ -135,7 +133,6 @@ SAFE_DEFAULTS: list[tuple[str, str | list]] = [
      ["Yes", "I consent", "Yes, I consent"]),
 
     # ── Generic yes/no ────────────────────────────────────────────────────
-    # (catch-all for employment agreements, non-compete, accommodation)
     (r"non.?compete|employment.?agreement|reasonable.?accommodation",
      ["No", "No, I do not"]),
 
@@ -152,11 +149,9 @@ SAFE_DEFAULTS: list[tuple[str, str | list]] = [
 ]
 
 
-# Sentinel value: when SAFE_DEFAULTS returns this, the caller must
-# enumerate the actual dropdown options and pick the best remote choice.
+# Sentinel value
 _REMOTE_SENTINEL = "__REMOTE_PICK__"
 
-# Ordered preference list for remote-preference dropdowns
 _REMOTE_PREFERENCE_KEYWORDS = [
     "yes", "remote", "open to remote", "open to hybrid", "hybrid",
     "flexible", "either", "both",
@@ -164,12 +159,6 @@ _REMOTE_PREFERENCE_KEYWORDS = [
 
 
 def pick_best_remote_option(options: list[str]) -> str | None:
-    """
-    Given the actual dropdown options for a remote-preference question,
-    return the best matching option text.
-    Prefers options containing 'yes', 'remote', 'hybrid', 'open', 'flexible'.
-    Falls back to the first available option.
-    """
     if not options:
         return None
     opts_lower = [(o.lower(), o) for o in options]
@@ -177,23 +166,10 @@ def pick_best_remote_option(options: list[str]) -> str | None:
         for ol, o in opts_lower:
             if kw in ol:
                 return o
-    # Last resort: return first non-empty option
     return options[0]
 
 
 def get_safe_default(label: str, options: list[str] | None = None) -> str | None:
-    """
-    Return a safe default answer for a required field whose label matches
-    one of the SAFE_DEFAULTS patterns.
-
-    If the default is a list (checkbox group / multi-option), intersect with
-    available `options` and return the first match; fall back to the first
-    list item.
-
-    Returns None if no pattern matches.
-    Special sentinel '__REMOTE_PICK__' is returned as-is; callers must
-    call pick_best_remote_option() to resolve it.
-    """
     label_lower = (label or "").lower()
     for pattern, default in SAFE_DEFAULTS:
         if re.search(pattern, label_lower):
@@ -202,7 +178,7 @@ def get_safe_default(label: str, options: list[str] | None = None) -> str | None
                     resolved = pick_best_remote_option(options)
                     if resolved:
                         return resolved
-                return None  # no options available yet; skip for now
+                return None
 
             if isinstance(default, list):
                 if options:
@@ -210,12 +186,11 @@ def get_safe_default(label: str, options: list[str] | None = None) -> str | None
                     for d in default:
                         if d.lower() in opts_lower:
                             return opts_lower[d.lower()]
-                    # partial match
                     for d in default:
                         for ol, o in opts_lower.items():
                             if d.lower() in ol:
                                 return o
-                return default[0]  # raw value; caller handles checkbox logic
+                return default[0]
             return default
     return None
 
@@ -230,8 +205,11 @@ _ERROR_FIELD_SELECTORS = (
     "input.error, textarea.error"
 )
 
-# JS is stored as a plain string to avoid Python-triple-quote / JS-backtick
-# conflicts that caused 'SyntaxError: Unexpected end of input' at runtime.
+# FIX: react-select check now inspects the VALUE container (.select__single-value
+# or .select__multi-value), not just the presence of .select__placeholder.
+# A placeholder div can be hidden (display:none) while the field still shows
+# as empty to the JS scan — causing false-positive "empty" reports on fields
+# that were already correctly filled in the first pass.
 _SCAN_REQUIRED_JS = (
     "() => {"
     "  const skip = new Set(['first_name','last_name','email','phone','country']);"
@@ -248,11 +226,13 @@ _SCAN_REQUIRED_JS = (
     "            && document.querySelector('label[for=\"' + el.id + '\"]').innerText.includes('*'));"
     "    if (!req) return;"
     "    if ((el.value || '').trim() !== '') return;"
+    # Skip candidate-location here — it is a Google Places typeahead handled separately
+    "    if (el.id === 'candidate-location') return;"
     "    var lbl = (document.querySelector('label[for=\"' + el.id + '\"]') || {}).innerText || '';"
     "    lbl = lbl.replace('*','').trim() || el.placeholder || el.name || el.id;"
     "    empty.push({ id: el.id, name: el.name, label: lbl, type: 'text' });"
     "  });"
-    # react-select combobox
+    # react-select combobox — FIX: use value container, not placeholder
     "  document.querySelectorAll('input[role=\"combobox\"]').forEach(function(el) {"
     "    if (skip.has(el.id)) return;"
     "    if (el.offsetWidth === 0 && el.offsetHeight === 0) return;"
@@ -263,8 +243,10 @@ _SCAN_REQUIRED_JS = (
     "    if (!req) return;"
     "    var control = el.closest('.select__control');"
     "    if (!control) return;"
-    "    var placeholder = control.querySelector('.select__placeholder');"
-    "    if (!placeholder) return;"
+    # A filled react-select has .select__single-value or .select__multi-value
+    # Only flag as empty when NEITHER value element is present
+    "    var hasValue = control.querySelector('.select__single-value, .select__multi-value');"
+    "    if (hasValue) return;"
     "    var lbl = (document.querySelector('label[for=\"' + el.id + '\"]') || {}).innerText || '';"
     "    lbl = lbl.replace('*','').trim() || el.name || el.id;"
     "    empty.push({ id: el.id, name: el.name, label: lbl, type: 'react-select' });"
@@ -300,11 +282,6 @@ _SCAN_REQUIRED_JS = (
 
 
 def _scan_required_empty(frame, logs: list) -> list[dict]:
-    """
-    Walk all visible required fields in `frame`.
-    Return a list of dicts describing fields that appear empty so the caller
-    can attempt a re-fill before hitting Submit.
-    """
     try:
         return frame.evaluate(_SCAN_REQUIRED_JS)
     except Exception as exc:
@@ -341,10 +318,6 @@ _ERROR_TEXT_SELECTORS = [
 
 
 def _parse_validation_errors(frame, logs: list) -> list[str]:
-    """
-    Return a deduplicated list of non-empty error message strings
-    found after a failed submit attempt.
-    """
     seen: set[str] = set()
     errors: list[str] = []
     for sel in _ERROR_TEXT_SELECTORS:
@@ -361,12 +334,6 @@ def _parse_validation_errors(frame, logs: list) -> list[str]:
 
 
 def _wait_outcome(page, frame, pre_url: str, logs: list, wait_s: float = 8) -> str:
-    """
-    Poll for up to `wait_s` seconds and return one of:
-      'AUTO_APPLIED'     — confirmation element found or URL changed away from /apply
-      'VALIDATION_FAILED' — validation error messages detected
-      'FAILED'           — timeout with no signal
-    """
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
         try:
@@ -397,6 +364,32 @@ def _wait_outcome(page, frame, pre_url: str, logs: list, wait_s: float = 8) -> s
     return "FAILED"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Escape any open react-select dropdown before proceeding to the next field
+# FIX: The root cause of "typing 'Yes' into question_60419386" was that the
+# country dropdown was left open after being filled. Every subsequent
+# _fill_react_select call was opening that same focused dropdown instead of
+# its own. We now close any open listbox before each fill.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _close_open_dropdowns(frame, page, logs: list) -> None:
+    """Press Escape + click body to close any stray open react-select listbox."""
+    try:
+        open_listbox = frame.locator("div[role='listbox']:visible")
+        if open_listbox.count() > 0:
+            try:
+                if page:
+                    page.keyboard.press("Escape")
+                else:
+                    frame.locator("body").click(position={"x": 5, "y": 5}, timeout=800)
+            except Exception:
+                pass
+            frame.wait_for_timeout(200)
+            logs.append("[submit_guard] Closed stray open dropdown before refill")
+    except Exception:
+        pass
+
+
 def submit_with_retry(
     page,
     frame,
@@ -408,10 +401,6 @@ def submit_with_retry(
     refill_fn,
     resume_path: str | None = None,
 ) -> str:
-    """
-    Click Submit, detect validation errors, re-fill highlighted fields,
-    and retry up to MAX_SUBMIT_RETRIES times.
-    """
     submit_btn_sel = "input#submit_app, button#submit_app, button[type='submit']"
 
     for attempt in range(1, MAX_SUBMIT_RETRIES + 2):
@@ -435,13 +424,16 @@ def submit_with_retry(
                         logs.append(f"[submit_guard] Resume re-upload failed: {exc}")
                     continue
 
+                # FIX: Close any stray open dropdown BEFORE filling the next field
+                # to prevent the previous react-select from swallowing the next fill
+                _close_open_dropdowns(frame, page, logs)
+
                 field_info = next(
                     (q for q in questions_data
                      if q.get("id") == ef["id"] or q.get("name") == ef["name"]),
                     ef
                 )
 
-                # For remote question: enumerate live options before calling get_safe_default
                 opts = field_info.get("options") if isinstance(field_info.get("options"), list) else None
                 opt_labels: list[str] | None = None
                 if opts:
@@ -450,7 +442,6 @@ def submit_with_retry(
                     else:
                         opt_labels = list(opts)
 
-                # If remote sentinel and no options cached, try to scrape them live
                 label_lower = (ef.get("label") or "").lower()
                 is_remote_field = bool(re.search(
                     r"remote|work.{0,10}(from|preference|location)|plan.{0,10}work.{0,10}remote",
@@ -483,6 +474,9 @@ def submit_with_retry(
                         f"[submit_guard] No safe default for required field '{ef['label']}' "
                         f"(id={ef['id']}) — leaving blank"
                     )
+
+        # FIX: Ensure no dropdown is open before clicking Submit
+        _close_open_dropdowns(frame, page, logs)
 
         try:
             btn = frame.locator(submit_btn_sel)
@@ -523,7 +517,6 @@ def submit_with_retry(
                 elif opts:
                     opt_labels = list(opts)
 
-                # scrape live remote options on retry too
                 is_remote = bool(re.search(
                     r"remote|work.{0,10}(from|preference|location)|plan.{0,10}work.{0,10}remote",
                     (matched_field.get("label") or "").lower()
@@ -542,6 +535,8 @@ def submit_with_retry(
                     logs.append(
                         f"[submit_guard] Retry re-fill '{matched_field['label']}' -> '{default}'"
                     )
+                    # FIX: close stray dropdown before retry refill too
+                    _close_open_dropdowns(frame, page, logs)
                     try:
                         refill_fn(frame, matched_field, default, logs, page)
                     except Exception as exc:

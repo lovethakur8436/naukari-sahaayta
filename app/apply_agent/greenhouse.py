@@ -230,6 +230,18 @@ def _fill_react_select(
         options.nth(matched_idx).click(timeout=3000)
         frame.wait_for_timeout(400)
         logs.append(f"react-select: clicked '{option_texts[matched_idx]}' for {field_id}")
+        # FIX: Always press Escape after clicking to close the listbox
+        # This prevents the dropdown from remaining open and swallowing the
+        # next field's fill (the focus-leak / "Australia" bug).
+        try:
+            kb = page.keyboard if page is not None else None
+            if kb:
+                kb.press("Escape")
+            else:
+                frame.locator("body").click(position={"x": 5, "y": 5}, timeout=800)
+        except Exception:
+            pass
+        frame.wait_for_timeout(150)
         return True
     except Exception as e:
         logs.append(f"react-select: click failed for {field_id}: {e}")
@@ -239,11 +251,6 @@ def _fill_react_select(
 def _fill_react_select_remote(
     frame, field_id: str, logs: list, page: Page = None
 ) -> bool:
-    """
-    Special handler for remote-preference dropdowns.
-    Enumerates ALL available options first, then picks the best match
-    using pick_best_remote_option() — avoids hardcoding any specific string.
-    """
     live_opts = _get_react_select_options(frame, field_id, page=page)
     if not live_opts:
         logs.append(f"react-select remote: could not enumerate options for '{field_id}'")
@@ -369,10 +376,6 @@ def _call_llm_with_fallback(prompt: str, logs: list) -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JS for scraping custom questions
-# FIX: checkbox/radio groups now also capture the GROUP-LEVEL question label
-# from the nearest <legend> or parent container label, so the LLM sees the
-# real question text (e.g. "countries you anticipate working in") instead of
-# the first option's own label (e.g. "Australia").
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SCRAPE_QUESTIONS_JS = (
@@ -445,21 +448,11 @@ _SCRAPE_QUESTIONS_JS = (
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Checkbox fill helper
-# FIX: answer_val from LLM is a LABEL string (e.g. "India"), not a DOM id.
-# Try label-match first, then fall back to treating it as a literal id.
-# Supports comma-separated values for multi-select checkbox groups.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fill_checkbox_group(
     frame, field_info: dict, answer_val: str, logs: list
 ) -> None:
-    """
-    Fill a checkbox group field.
-    `answer_val` may be:
-      - A comma-separated list of LABELS  (e.g. "India")  <- LLM default
-      - A comma-separated list of DOM IDs (e.g. "question_60419387[]_1234")
-    We try both strategies so either format works.
-    """
     raw_tokens = [s.strip() for s in str(answer_val).split(",") if s.strip()]
     opts = field_info.get("options", [])
     valid_ids = {o.get("id") for o in opts if o.get("id")}
@@ -467,12 +460,10 @@ def _fill_checkbox_group(
     for token in raw_tokens:
         target_id: str | None = None
 
-        # 1. Exact DOM-id match
         if token in valid_ids:
             target_id = token
             logs.append(f"Checkbox: exact id match '{token}'")
         else:
-            # 2. Label exact match (case-insensitive)
             matched = next(
                 (o for o in opts if o.get("label", "").lower() == token.lower()),
                 None,
@@ -483,7 +474,6 @@ def _fill_checkbox_group(
                     f"Checkbox: label-exact matched '{token}' -> id '{target_id}'"
                 )
             else:
-                # 3. Label partial / contains match
                 matched = next(
                     (
                         o for o in opts
@@ -511,15 +501,78 @@ def _fill_checkbox_group(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# candidate-location (Google Places typeahead) — dedicated fill helper
+# FIX: The plain blur() approach was leaving the field invalid. We now try
+# to pick the first dropdown suggestion. If none appears, we accept the typed
+# value by pressing Tab (which commits it in most Places implementations).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fill_location_typeahead(
+    frame, field_id: str, city: str, logs: list, page: Page = None
+) -> None:
+    """
+    Fill a Google Places / freeform city typeahead field.
+    Strategy:
+      1. Type the city name character-by-character.
+      2. Wait up to 2 s for an autocomplete suggestion to appear.
+      3. If a suggestion is visible, click the first one.
+      4. If no suggestion, press Tab to commit the typed value.
+    """
+    try:
+        el = frame.locator(f"input{_safe_css_id(field_id)}")
+        if el.count() == 0:
+            logs.append(f"Location typeahead: field '{field_id}' not found")
+            return
+
+        el.click(timeout=3000)
+        el.fill("", timeout=2000)   # clear first
+        frame.wait_for_timeout(200)
+        el.type(city, delay=60)    # type slowly so autocomplete fires
+        frame.wait_for_timeout(1200)
+
+        # Try to find a suggestion dropdown
+        suggestion_sel = (
+            f"div[role='option']:visible, "
+            f"[id^='react-select-{field_id}-option']:visible, "
+            "ul.pac-container li:visible, "
+            ".pac-item:visible"
+        )
+        suggestion = frame.locator(suggestion_sel).first
+        try:
+            suggestion.wait_for(state="visible", timeout=2000)
+            suggestion.click(timeout=2000)
+            logs.append(
+                f"Location typeahead '{field_id}': clicked suggestion '{suggestion.inner_text().strip()}'"
+            )
+            return
+        except Exception:
+            pass
+
+        # No suggestion — commit with Tab
+        try:
+            if page:
+                page.keyboard.press("Tab")
+            else:
+                el.press("Tab")
+            frame.wait_for_timeout(300)
+            logs.append(
+                f"Location typeahead '{field_id}': no suggestion found — committed '{city}' via Tab"
+            )
+        except Exception as tab_err:
+            logs.append(f"Location typeahead Tab commit failed: {tab_err}")
+            try:
+                el.evaluate("el => el.dispatchEvent(new Event('blur', { bubbles: true }))")
+            except Exception:
+                pass
+    except Exception as e:
+        logs.append(f"Location typeahead fill error for '{field_id}': {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Universal field refill callback (used by submit_with_retry)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _refill_field(frame, field_info: dict, answer: str, logs: list, page: Page):
-    """
-    Thin dispatcher: fill `field_info` with `answer` using the correct
-    strategy (react-select / checkbox / text). Used as the `refill_fn`
-    callback passed to submit_with_retry.
-    """
     ftype = field_info.get("type", "text")
     fid = field_info.get("id", "")
     fname = field_info.get("name", "")
@@ -536,10 +589,15 @@ def _refill_field(frame, field_info: dict, answer: str, logs: list, page: Page):
             _fill_react_select(frame, fid, answer, logs, page=page)
 
     elif ftype == "checkbox":
-        # Use the unified helper which handles both label and id tokens
         _fill_checkbox_group(frame, field_info, answer, logs)
 
     else:
+        # FIX: candidate-location is a Google Places typeahead —
+        # use dedicated helper instead of plain fill()+blur()
+        if fid == "candidate-location":
+            _fill_location_typeahead(frame, fid, answer, logs, page=page)
+            return
+
         sel = f"[id='{fid}']" if fid else f"[name='{fname}']"
         try:
             frame.locator(sel).fill(answer, timeout=5000)
@@ -655,43 +713,16 @@ class GreenhouseApplyAgent(BaseApplyAgent):
             if not questions_data:
                 questions_data = []
 
-            # candidate-location is a typeahead — fill directly
-            DIRECT_FILL_FIELDS: dict[str, str] = {
-                "candidate-location": candidate_profile.get("location", "Hyderabad"),
+            # FIX: Use dedicated typeahead helper for candidate-location
+            # (Google Places input — plain blur() was leaving it invalid)
+            LOCATION_FIELDS: dict[str, str] = {
+                "candidate-location": candidate_profile.get("location", "Hyderabad, India"),
             }
-
-            for field_id, fill_value in DIRECT_FILL_FIELDS.items():
-                try:
-                    el = frame.locator(f"input{_safe_css_id(field_id)}")
-                    if el.count() > 0:
-                        el.fill(fill_value, timeout=3000)
-                        el.evaluate(
-                            "el => el.dispatchEvent(new Event('input', { bubbles: true }))"
-                        )
-                        frame.wait_for_timeout(600)
-                        suggestion = frame.locator(
-                            f"div[role='option']:visible, "
-                            f"[id^='react-select-{field_id}-option']:visible"
-                        ).first
-                        if suggestion.count() > 0:
-                            suggestion.click(timeout=2000)
-                            result["logs"].append(
-                                f"Direct-fill '{field_id}': picked suggestion '{suggestion.inner_text()}'"
-                            )
-                        else:
-                            el.evaluate(
-                                "el => el.dispatchEvent(new Event('blur', { bubbles: true }))"
-                            )
-                            result["logs"].append(
-                                f"Direct-fill '{field_id}' = '{fill_value}' (no suggestion, blurred)"
-                            )
-                        questions_data = [
-                            q for q in questions_data if q.get("id") != field_id
-                        ]
-                except Exception as df_err:
-                    result["logs"].append(
-                        f"Direct-fill '{field_id}' failed: {df_err}"
-                    )
+            for field_id, fill_value in LOCATION_FIELDS.items():
+                el = frame.locator(f"input{_safe_css_id(field_id)}")
+                if el.count() > 0:
+                    _fill_location_typeahead(frame, field_id, fill_value, result["logs"], page=page)
+                    questions_data = [q for q in questions_data if q.get("id") != field_id]
 
             TYPEAHEAD_FIELD_HINTS: dict[str, str] = {}
 
@@ -907,7 +938,6 @@ Return a flat JSON object: keys = field `id` (use the top-level `id` for the gro
                                     pass
 
                     elif ftype == "checkbox":
-                        # Unified helper handles both label strings and DOM ids
                         _fill_checkbox_group(
                             frame, field_info, str(answer_val), result["logs"]
                         )
