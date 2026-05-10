@@ -7,22 +7,22 @@ Portal behaviours handled:
   - boards.greenhouse.io/gitlab/...     -> direct Greenhouse form (input#first_name)
   - job-boards.greenhouse.io/figma/...  -> Greenhouse form embedded at bottom of listing page
   - boards.greenhouse.io/stripe/...     -> redirects to stripe.com listing, then
-                                           stripe.com/.../apply which is a React SPA
-                                           (no input#first_name — uses generic input/textarea)
+                                           stripe.com/.../apply loads a Workday-embedded
+                                           iframe — no input#first_name in top-level DOM.
 
 Resolution strategy (tried in order):
-  1. Strict Greenhouse form present? (input#first_name)         -> done.
-  2. Scroll to bottom -> recheck strict.                        -> Figma pattern.
-  3. Click Apply button -> wait 3s for SPA render
-     -> recheck strict OR broad.                                -> Stripe pattern.
+  1. Strict Greenhouse form present? (input#first_name)              -> done.
+  2. Scroll to bottom -> recheck strict.                             -> Figma pattern.
+  3. Click Apply button -> wait for SPA render
+     -> recheck strict OR broad OR iframe.                           -> Stripe pattern.
   4. /apply URL heuristic (only if NOT already on /apply URL)
-     -> wait for SPA render -> recheck strict OR broad.         -> Stripe fallback.
+     -> wait for SPA render -> recheck strict OR broad OR iframe.    -> Stripe fallback.
   5. Give up -> SKIPPED.
 
 Broad form detection (steps 3 & 4):
-  Checks for any visible <input type=text/email> or <textarea> inside a <form>
-  or [role=main] container. Only runs when on an /apply or /application URL
-  to avoid false-positives on listing/search pages.
+  - Checks for any visible <input type=text/email> or <textarea> inside <form>/[role=main].
+  - Also detects iframe-embedded forms (Stripe/Workday) by presence of <iframe> on /apply URLs.
+  - Only runs when on an /apply or /application URL to avoid false-positives.
 """
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
@@ -30,7 +30,7 @@ from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 # Strict selector — standard Greenhouse boards (GitLab, Figma, etc.)
 _STRICT_FORM_SELECTOR = "input#first_name"
 
-# Broad selectors — React SPA portals (Stripe) where field IDs are dynamic
+# Broad selectors — React SPA portals where field IDs are dynamic
 _BROAD_FORM_SELECTORS = [
     "form input[type='text']:visible",
     "form input[type='email']:visible",
@@ -55,7 +55,7 @@ _APPLY_BUTTON_SELECTORS = [
     "[class*='ApplyButton']:visible",
 ]
 
-# Extra wait after navigation to let React SPAs hydrate before checking for form
+# Extra wait after navigation to let React SPAs / Workday iframes hydrate
 _SPA_RENDER_WAIT_MS = 3_000
 
 
@@ -74,24 +74,42 @@ def _check_strict(page: Page, timeout_ms: int = 6_000) -> bool:
 
 def _check_broad(page: Page, logs: list) -> bool:
     """
-    Broader form detection for React SPA portals (Stripe).
-    Only runs when already on an /apply or /application URL to avoid
-    false-positives on listing/search pages.
+    Broader form detection for React SPA / iframe portals.
+    Only runs when on an /apply or /application URL to avoid false-positives.
+
+    Three layers:
+      1. Visible form inputs in the top-level DOM (React SPA forms)
+      2. <iframe> presence on the page (Stripe embeds Workday in an iframe;
+         the iframe itself is the form even though input#first_name is absent
+         from the parent frame).
     """
     url_lower = page.url.lower()
     if "/apply" not in url_lower and "/application" not in url_lower:
         logs.append("_check_broad: skipped (not on an /apply URL)")
         return False
 
+    # Layer 1: visible inputs in top-level DOM
     for sel in _BROAD_FORM_SELECTORS:
         try:
             if page.locator(sel).first.count() > 0:
-                logs.append(f"_check_broad: form detected via '{sel}'")
+                logs.append(f"_check_broad: form detected via top-level selector '{sel}'")
                 return True
         except Exception:
             continue
 
-    logs.append("_check_broad: no form inputs found")
+    # Layer 2: iframe presence (Stripe/Workday embed pattern)
+    try:
+        iframe_count = page.locator("iframe").count()
+        if iframe_count > 0:
+            logs.append(
+                f"_check_broad: found {iframe_count} iframe(s) on /apply page — "
+                "treating as embedded form (Stripe/Workday pattern)"
+            )
+            return True
+    except Exception:
+        pass
+
+    logs.append("_check_broad: no form inputs or iframes found")
     return False
 
 
@@ -108,8 +126,8 @@ def _scroll_and_check_strict(page: Page) -> bool:
 
 def _wait_spa_then_check(page: Page, logs: list, app_id=None) -> bool:
     """
-    Wait for SPA hydration, take a debug screenshot, then try both
-    strict and broad detection. Used after any navigation to an /apply page.
+    Wait for SPA/iframe hydration, take a debug screenshot, then try
+    strict -> broad detection in order.
     """
     try:
         page.wait_for_load_state("networkidle", timeout=15_000)
@@ -118,11 +136,10 @@ def _wait_spa_then_check(page: Page, logs: list, app_id=None) -> bool:
 
     page.wait_for_timeout(_SPA_RENDER_WAIT_MS)
 
-    # Debug screenshot so you can visually confirm what loaded
     if app_id:
         try:
             page.screenshot(path=f"data/debug_spa_{app_id}.png")
-            logs.append(f"Debug SPA screenshot saved: data/debug_spa_{app_id}.png")
+            logs.append(f"Debug SPA screenshot: data/debug_spa_{app_id}.png")
         except Exception:
             pass
 
@@ -130,7 +147,7 @@ def _wait_spa_then_check(page: Page, logs: list, app_id=None) -> bool:
         logs.append("_wait_spa_then_check: strict form found after SPA wait")
         return True
     if _check_broad(page, logs):
-        logs.append("_wait_spa_then_check: broad form found after SPA wait")
+        logs.append("_wait_spa_then_check: broad/iframe form confirmed after SPA wait")
         return True
     return False
 
@@ -185,7 +202,7 @@ def resolve_apply_form(page: Page, logs: list, app_id=None) -> bool:
         app_id: Optional application ID used for debug screenshot filenames.
 
     Returns:
-        True  — form is ready, agent can start filling fields.
+        True  — form is ready (strict Greenhouse, SPA inputs, or iframe embed detected).
         False — no form found after all strategies (job closed / unsupported portal).
     """
     logs.append(f"resolve_apply_form: starting on {page.url}")
@@ -201,11 +218,11 @@ def resolve_apply_form(page: Page, logs: list, app_id=None) -> bool:
         logs.append("resolve_apply_form: strict form found after scroll.")
         return True
 
-    # ── Step 3: Click Apply button then wait for SPA render ───────────────
+    # ── Step 3: Click Apply button then wait for SPA/iframe render ─────────
     logs.append("resolve_apply_form: hunting for Apply button...")
     clicked = _find_and_click_apply(page, logs)
     if clicked:
-        logs.append("resolve_apply_form: Apply button clicked — waiting for SPA render...")
+        logs.append("resolve_apply_form: Apply button clicked — waiting for SPA/iframe render...")
         if _wait_spa_then_check(page, logs, app_id=app_id):
             logs.append("resolve_apply_form: form confirmed after Apply click.")
             return True

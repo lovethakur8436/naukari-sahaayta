@@ -10,6 +10,15 @@ from groq import Groq
 _MAX_OPTIONS_FOR_LLM = 40
 
 
+def _safe_css_id(field_id: str) -> str:
+    """
+    Return a safe Playwright attribute selector for a field ID.
+    CSS shorthand  input#foo[]  is invalid when the ID contains brackets.
+    Using [id='foo[]'] is always safe regardless of special characters.
+    """
+    return f"[id='{field_id}']"
+
+
 def _get_react_select_options(page, field_id: str) -> list[str]:
     control_div = page.locator(
         f"xpath=//input[@id='{field_id}']/ancestor::div[contains(@class,'select__control')]"
@@ -37,7 +46,8 @@ def _get_react_select_options(page, field_id: str) -> list[str]:
 
 
 def _get_react_select_options_typeahead(page, field_id: str, search_term: str) -> list[str]:
-    input_el = page.locator(f"input#{field_id}")
+    # Use safe attribute selector for input to avoid [] crash
+    input_el = page.locator(f"input{_safe_css_id(field_id)}")
     control_div = page.locator(
         f"xpath=//input[@id='{field_id}']/ancestor::div[contains(@class,'select__control')]"
     )
@@ -67,10 +77,18 @@ def _get_react_select_options_typeahead(page, field_id: str, search_term: str) -
 
 
 def _fill_react_select(page, field_id: str, answer_text: str, logs: list) -> bool:
+    # Fix 2: skip filling entirely when LLM returned empty/null answer.
+    # Previously an empty string would match via startswith('') and silently
+    # pick the FIRST option (e.g. 'she/her/hers', '0-2 years', 'Yes').
+    if not answer_text or not answer_text.strip():
+        logs.append(f"react-select: skipping '{field_id}' — LLM returned empty answer, leaving blank")
+        return False
+
     control_div = page.locator(
         f"xpath=//input[@id='{field_id}']/ancestor::div[contains(@class,'select__control')]"
     )
-    input_el = page.locator(f"input#{field_id}")
+    # Fix 1: use safe attribute selector — avoids CSS crash on IDs like foo[]
+    input_el = page.locator(f"input{_safe_css_id(field_id)}")
 
     try:
         control_div.click(timeout=4000)
@@ -79,7 +97,7 @@ def _fill_react_select(page, field_id: str, answer_text: str, logs: list) -> boo
         logs.append(f"react-select open failed for {field_id}: {e}")
         return False
 
-    first_word = answer_text.split()[0] if answer_text else answer_text
+    first_word = answer_text.split()[0]
     try:
         input_el.type(first_word, delay=50)
         page.wait_for_timeout(500)
@@ -249,12 +267,7 @@ class GreenhouseApplyAgent(BaseApplyAgent):
         page.goto(url)
         page.wait_for_load_state("networkidle")
 
-        # ------------------------------------------------------------------ #
-        # Dynamic apply-form resolver                                         #
-        # Handles: direct forms, embedded forms (Figma), listing-page         #
-        # redirects with an Apply button (Stripe), /apply URL heuristic.     #
-        # ------------------------------------------------------------------ #
-        form_found = resolve_apply_form(page, result["logs"])
+        form_found = resolve_apply_form(page, result["logs"], app_id=application.id)
         if not form_found:
             result["logs"].append(
                 "No apply form found after exhausting all strategies. "
@@ -426,6 +439,9 @@ INSTRUCTIONS:
 6. Reasonable accommodation -> "No" or leave blank.
 7. Gender/veteran/disability/hispanic -> use corresponding profile fields.
 8. "How did you hear" -> "LinkedIn".
+9. OPTIONAL FIELDS: If a field is optional and you have no clear answer, omit the key entirely
+   or return null — do NOT return an empty string "". Returning "" will silently pick
+   the first available option, which is almost always wrong.
 
 CRITICAL RULE FOR react-select FIELDS:
 - The `options` list contains the EXACT visible text of every choice available in that dropdown.
@@ -445,14 +461,18 @@ CRITICAL RULE FOR radio FIELDS:
 Form Fields:
 {json.dumps(llm_questions, indent=2)}
 
-Return a flat JSON object: keys = field `id`, values = the answer string.
+Return a flat JSON object: keys = field `id`, values = the answer string (or omit key if no clear answer).
 """
 
             answers = _call_llm_with_fallback(prompt, result["logs"])
             answers.update(pre_resolved)
 
             for field_id, answer_val in answers.items():
+                # Fix 2: skip null / empty answers from LLM entirely
                 if not field_id:
+                    continue
+                if answer_val is None or str(answer_val).strip() == "":
+                    result["logs"].append(f"Skipping '{field_id}' — LLM returned null/empty answer")
                     continue
                 try:
                     field_info = next(
@@ -475,7 +495,8 @@ Return a flat JSON object: keys = field `id`, values = the answer string.
                             result["logs"].append(f"WARNING: react-select failed for {field_id} = '{answer_val}'")
                             if not field_info.get("options"):
                                 try:
-                                    page.locator(f"input#{field_info['id']}").fill(str(answer_val), timeout=3000)
+                                    # Fix 1: safe selector for typeahead fallback too
+                                    page.locator(f"input{_safe_css_id(field_info['id'])}").fill(str(answer_val), timeout=3000)
                                     result["logs"].append(f"Typeahead plain-fill fallback: {field_id} = '{answer_val}'")
                                 except Exception:
                                     pass
@@ -499,8 +520,9 @@ Return a flat JSON object: keys = field `id`, values = the answer string.
                         el.evaluate("el => el.dispatchEvent(new Event('change', { bubbles: true }))")
 
                     else:
+                        # Fix 1: always use attribute selector, never # shorthand
                         sel = (
-                            f"[id='{field_info['id']}']" if field_info["id"] and "'" not in field_info["id"]
+                            f"[id='{field_info['id']}']" if field_info["id"]
                             else f"[name='{field_info['name']}']"
                         )
                         page.locator(sel).fill(str(answer_val), timeout=5000)
