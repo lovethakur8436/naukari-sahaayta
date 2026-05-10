@@ -64,7 +64,7 @@ def _esc(text: str) -> str:
     """
     Escape a raw string for safe LaTeX embedding.
     IMPORTANT: Skip strings that already contain LaTeX markup to prevent
-    double-escaping (e.g. LLM returning 99\% should not become 99\\%)
+    double-escaping (e.g. LLM returning 99% should not become 99\\%)
     """
     if not text:
         return ""
@@ -389,19 +389,27 @@ def _render_tex_from_json(data: dict, base: dict) -> str:
         exp_blocks.append(block)
     tpl = tpl.replace('<<EXPERIENCE_BLOCKS>>', '\n'.join(exp_blocks))
 
-    # Projects
+    # Projects — FIX: build the heading line via string concatenation, not a
+    # single f-string, to avoid the brace-counting SyntaxError Python 3.12+
+    # raises when LaTeX double-braces and f-string braces are deeply nested.
     proj_blocks = []
     for proj in data.get('projects', []):
         bullets_tex = '\n'.join(
             f'          \\resumeItem{{{_esc(b)}}}'
             for b in proj.get('bullets', [])
         )
+        name_esc = _esc(proj["name"])
+        tech_esc = _esc(proj["tech"])
+        # Build the \resumeProjectHeading line as a plain string — no nested f-string braces
+        heading_line = (
+            '    \\resumeProjectHeading\n'
+            '      {\\textbf{' + name_esc + '} $|$ \\emph{\\small{' + tech_esc + '}}}{}\n'
+        )
         block = (
-            f'    \\resumeProjectHeading\n'
-            f'      {{\\textbf{{{_esc(proj["name"])}}} $|$ \\emph{{\\small{{{_esc(proj["tech"])}}}}}}}}{{}}\n'
-            f'      \\resumeItemListStart\n'
-            f'{bullets_tex}\n'
-            f'      \\resumeItemListEnd'
+            heading_line
+            + '      \\resumeItemListStart\n'
+            + bullets_tex + '\n'
+            + '      \\resumeItemListEnd'
         )
         proj_blocks.append(block)
     tpl = tpl.replace('<<PROJECT_BLOCKS>>', '\n'.join(proj_blocks))
