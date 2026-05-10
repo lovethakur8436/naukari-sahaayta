@@ -136,6 +136,7 @@ def get_safe_default(label: str, options: list[str] | None = None) -> str | None
 _SCAN_REQUIRED_JS = (
     "() => {"
     "  var skip = new Set(['first_name','last_name','email','phone','country']);"
+    "  var seenIds = new Set();"
     "  var empty = [];"
     # ── text / textarea ──────────────────────────────────────────────────
     "  document.querySelectorAll("
@@ -149,6 +150,8 @@ _SCAN_REQUIRED_JS = (
     "            && document.querySelector('label[for=\"' + el.id + '\"]').innerText.includes('*'));"
     "    if (!req) return;"
     "    if ((el.value || '').trim() !== '') return;"
+    "    if (seenIds.has(el.id)) return;"
+    "    seenIds.add(el.id);"
     "    if (el.id === 'candidate-location') { empty.push({ id: el.id, name: el.name, label: 'Location (City)', type: 'location-typeahead' }); return; }"
     "    var lbl = (document.querySelector('label[for=\"' + el.id + '\"]') || {}).innerText || '';"
     "    lbl = lbl.replace('*','').trim() || el.placeholder || el.name || el.id;"
@@ -158,6 +161,7 @@ _SCAN_REQUIRED_JS = (
     "  document.querySelectorAll('input[role=\"combobox\"]').forEach(function(el) {"
     "    if (skip.has(el.id)) return;"
     "    if (el.offsetWidth === 0 && el.offsetHeight === 0) return;"
+    "    if (seenIds.has(el.id)) return;"
     "    var req = el.required"
     "      || el.getAttribute('aria-required') === 'true'"
     "      || !!(document.querySelector('label[for=\"' + el.id + '\"]')"
@@ -167,6 +171,7 @@ _SCAN_REQUIRED_JS = (
     "    if (!control) return;"
     "    var hasValue = control.querySelector('.select__single-value, .select__multi-value');"
     "    if (hasValue) return;"
+    "    seenIds.add(el.id);"
     "    var lbl = (document.querySelector('label[for=\"' + el.id + '\"]') || {}).innerText || '';"
     "    lbl = lbl.replace('*','').trim() || el.name || el.id;"
     "    empty.push({ id: el.id, name: el.name, label: lbl, type: 'react-select' });"
@@ -203,7 +208,20 @@ _SCAN_REQUIRED_JS = (
 
 def _scan_required_empty(frame, logs: list) -> list[dict]:
     try:
-        return frame.evaluate(_SCAN_REQUIRED_JS)
+        results = frame.evaluate(_SCAN_REQUIRED_JS)
+        # Deduplicate by field ID — Greenhouse sometimes registers the same
+        # combobox input both as text and as react-select if the DOM is mid-render.
+        seen: set[str] = set()
+        deduped: list[dict] = []
+        for ef in (results or []):
+            fid = ef.get("id", "")
+            if fid and fid in seen:
+                logs.append(f"[submit_guard] dedup: skipping duplicate field id '{fid}'")
+                continue
+            if fid:
+                seen.add(fid)
+            deduped.append(ef)
+        return deduped
     except Exception as exc:
         logs.append(f"[submit_guard] _scan_required_empty error: {exc}")
         return []
@@ -249,17 +267,9 @@ def _close_open_dropdowns(frame, page, logs: list) -> None:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FIX: Verify a react-select field actually holds a value after filling.
-# Greenhouse re-renders the form DOM after each selection which can silently
-# reset sibling react-selects. This check reads .select__single-value text
-# for the specific input#field_id and returns the current displayed value
-# (empty string if nothing is selected).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_react_select_current_value(frame, field_id: str) -> str:
-    """
-    Returns the currently displayed value of the react-select whose
-    hidden input has id=field_id, or '' if nothing is selected.
-    """
     js = f"""
     () => {{
         var inp = document.getElementById('{field_id}');
@@ -277,8 +287,24 @@ def _get_react_select_current_value(frame, field_id: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX: Isolated react-select fill — clicks the control for THIS field's id
-# only, not whatever is currently focused.
+# FIX: Isolated react-select fill — targets THIS field's container only.
+#
+# Root cause of the "Australia" bug:
+#   Greenhouse re-renders sibling react-selects after each country selection.
+#   On re-render, all combobox inputs share a single listbox div whose
+#   aria-controls attribute still points at the COUNTRY field's listbox ID.
+#   So when submit_guard tried to fill question_60419388 (auth) it opened
+#   the correct combobox but then searched for options in the country listbox,
+#   finding nothing, then fell through to a global div[role='listbox'] query
+#   which found the country dropdown (already open from a prior iteration).
+#
+# Fix:
+#   1. Always target the listbox via the specific input's aria-controls.
+#   2. If aria-controls listbox is missing/wrong, check that the listbox
+#      is a DOM descendant of the same .select__container as our input.
+#      If not — close all dropdowns, re-click our control, and retry.
+#   3. Add a 700ms post-fill settle wait (Greenhouse DOM re-render window)
+#      before the caller can trigger the next fill.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fill_react_select_isolated(
@@ -291,16 +317,6 @@ def _fill_react_select_isolated(
     """
     Fill a react-select for a specific field_id.
     Returns True on success.
-
-    Strategy:
-      1. Close any open dropdown first.
-      2. Find the container that owns input#<field_id>.
-      3. Click THAT container's .select__control — not the globally focused one.
-      4. Type to filter, then click the matching option.
-      5. Verify the value stuck via _get_react_select_current_value().
-         Greenhouse re-renders sibling selects after each fill, which can
-         silently clear a previously set value. If the value is gone after
-         the first fill we retry once.
     """
     _close_open_dropdowns(frame, page, logs)
 
@@ -311,19 +327,19 @@ def _fill_react_select_isolated(
                 logs.append(f"[guard-isolated] input#{field_id} not found")
                 return False
 
-            ctrl_js = f"""
+            has_ctrl = frame.evaluate(f"""
             () => {{
                 var inp = document.getElementById('{field_id}');
-                if (!inp) return null;
-                var ctrl = inp.closest('.select__control');
-                return ctrl ? true : false;
+                if (!inp) return false;
+                return !!inp.closest('.select__control');
             }}
-            """
-            has_ctrl = frame.evaluate(ctrl_js)
+            """)
             if not has_ctrl:
                 logs.append(f"[guard-isolated] no .select__control for #{field_id}")
                 return False
 
+            # Click THIS field's control specifically via JS to avoid
+            # accidentally activating whichever element has keyboard focus.
             frame.evaluate(f"""
             () => {{
                 var inp = document.getElementById('{field_id}');
@@ -333,28 +349,54 @@ def _fill_react_select_isolated(
                 }}
             }}
             """)
-            frame.wait_for_timeout(300)
+            frame.wait_for_timeout(350)
 
             inp_locator.fill("")
             inp_locator.type(value[:12], delay=40)
-            frame.wait_for_timeout(400)
+            frame.wait_for_timeout(450)
 
+            # Get options: first try field's own aria-controls listbox,
+            # then fall back to listbox scoped inside our select container.
+            # NEVER use a global div[role='listbox'] query — that can match
+            # the country dropdown's still-open listbox from a prior fill.
             opts_js = f"""
             () => {{
                 var inp = document.getElementById('{field_id}');
                 if (!inp) return [];
+
+                // Preferred: field-specific listbox via aria-controls
                 var listbox_id = inp.getAttribute('aria-controls');
                 var listbox = listbox_id ? document.getElementById(listbox_id) : null;
-                if (!listbox) {{
-                    listbox = document.querySelector("div[role='listbox']:not([style*='display: none'])");
+
+                // Verify the listbox actually belongs to THIS field's container
+                if (listbox) {{
+                    var container = inp.closest('.select__container, .select__control');
+                    if (container && !container.contains(listbox) && !document.getElementById(listbox_id)) {{
+                        listbox = null;  // stale ID pointing at another field's listbox
+                    }}
                 }}
+
+                // Fallback: find listbox scoped inside our .select__container
+                if (!listbox) {{
+                    var parentContainer = inp.closest('[class*="select"]');
+                    if (parentContainer) {{
+                        listbox = parentContainer.querySelector("div[role='listbox']");
+                    }}
+                }}
+
                 if (!listbox) return [];
-                return Array.from(listbox.querySelectorAll("div[role='option']")).map(o => o.innerText.trim());
+
+                var opts = Array.from(listbox.querySelectorAll("div[role='option']")).map(o => o.innerText.trim());
+                return opts.filter(o => o.length > 0);
             }}
             """
             options = frame.evaluate(opts_js)
+
             if not options:
-                logs.append(f"[guard-isolated] no options visible for #{field_id} after typing '{value}'")
+                logs.append(
+                    f"[guard-isolated] no options in field-scoped listbox for "
+                    f"#{field_id} after typing '{value}' — closing and aborting"
+                )
                 _close_open_dropdowns(frame, page, logs)
                 return False
 
@@ -382,13 +424,20 @@ def _fill_react_select_isolated(
                 _close_open_dropdowns(frame, page, logs)
                 return False
 
+            # Click the matched option via field-scoped listbox only.
             click_js = f"""
             (matchedText) => {{
                 var inp = document.getElementById('{field_id}');
                 if (!inp) return false;
+
                 var listbox_id = inp.getAttribute('aria-controls');
                 var listbox = listbox_id ? document.getElementById(listbox_id) : null;
-                if (!listbox) listbox = document.querySelector("div[role='listbox']:not([style*='display: none'])");
+
+                if (!listbox) {{
+                    var parentContainer = inp.closest('[class*="select"]');
+                    if (parentContainer) listbox = parentContainer.querySelector("div[role='listbox']");
+                }}
+
                 if (!listbox) return false;
                 var opts = listbox.querySelectorAll("div[role='option']");
                 for (var o of opts) {{
@@ -401,8 +450,9 @@ def _fill_react_select_isolated(
             }}
             """
             clicked = frame.evaluate(click_js, matched)
-            # Settle: wait for Greenhouse to re-render sibling fields after this selection
-            frame.wait_for_timeout(450)
+
+            # Settle: 700ms for Greenhouse to re-render sibling fields
+            frame.wait_for_timeout(700)
             _close_open_dropdowns(frame, page, logs)
 
             if clicked:
@@ -423,7 +473,7 @@ def _fill_react_select_isolated(
         return False
 
     # ── Verify the value stuck (Greenhouse sometimes re-renders siblings) ──
-    frame.wait_for_timeout(300)
+    frame.wait_for_timeout(350)
     current = _get_react_select_current_value(frame, field_id)
     if current and value.lower() in current.lower():
         logs.append(f"[guard-isolated] verified #{field_id} = '{current}'")
@@ -434,10 +484,10 @@ def _fill_react_select_isolated(
         f"[guard-isolated] #{field_id} value cleared after fill (got '{current}') — retrying once"
     )
     _close_open_dropdowns(frame, page, logs)
-    frame.wait_for_timeout(300)
+    frame.wait_for_timeout(400)
     ok2 = _attempt_fill()
     if ok2:
-        frame.wait_for_timeout(300)
+        frame.wait_for_timeout(350)
         current2 = _get_react_select_current_value(frame, field_id)
         logs.append(f"[guard-isolated] retry result for #{field_id}: '{current2}'")
     return ok2
@@ -530,13 +580,9 @@ def _guard_fill_field(
     """
     Fill a single empty required field during the submit-guard pass.
 
-    FIX for the country-dropdown corruption:
-    - For react-select fields, use _fill_react_select_isolated() which targets
-      the specific field's container via its input ID, not the globally focused element.
-    - Includes post-fill verification + automatic retry if Greenhouse re-renders
-      and clears the value.
-    - Only fall back to refill_fn for non-react-select fields (text, checkbox).
-    - Always close dropdowns before and after every fill.
+    Uses _fill_react_select_isolated() for react-select fields to ensure
+    each field's own container and listbox is targeted — never the globally
+    focused element or a stale listbox from a previously filled field.
     """
     ftype = ef.get("type")
     field_id = ef.get("id", "")

@@ -4,10 +4,10 @@
 % DO NOT EDIT LAYOUT/GEOMETRY — only <<...>> placeholders
 % are substituted at runtime by engine.py.
 % ============================================================
-\documentclass[9.5pt, letterpaper]{article}
+\documentclass[10pt, letterpaper]{article}
 
 % ---------- Packages ----------
-\usepackage[top=0.35in, bottom=0.35in, left=0.45in, right=0.45in]{geometry}
+\usepackage[top=0.30in, bottom=0.30in, left=0.45in, right=0.45in]{geometry}
 \usepackage{latexsym}
 \usepackage[empty]{fullpage}
 \usepackage{titlesec}
@@ -20,11 +20,10 @@
 \usepackage[english]{babel}
 \usepackage{tabularx}
 \usepackage[T1]{fontenc}
-\usepackage{lmodern}
-\input{glyphtounicode}
-
-% ---------- ATS Readability ----------
-\pdfgentounicode=1
+% Charter: denser and sharper than lmodern — looks fuller on page
+\usepackage{charter}
+% glyphtounicode: load only if available (path differs across TeX distros)
+\IfFileExists{glyphtounicode.tex}{\input{glyphtounicode}\pdfgentounicode=1}{}
 
 % ---------- Page style ----------
 \pagestyle{fancy}
@@ -45,29 +44,29 @@
 
 % ---------- Section formatting ----------
 \titleformat{\section}{
-  \vspace{-4pt}\scshape\raggedright\normalsize\bfseries
+  \vspace{-5pt}\scshape\raggedright\normalsize\bfseries
 }{}{0em}{}[\color{black}\titlerule \vspace{-4pt}]
 
 % ---------- Custom commands ----------
 \newcommand{\resumeItem}[1]{
   \item\small{
-    {#1}\vspace{-1pt}
+    {#1}\vspace{-2pt}
   }
 }
 
 \newcommand{\resumeSubheading}[4]{
-  \vspace{-1pt}\item
+  \vspace{-2pt}\item
     \begin{tabular*}{0.98\textwidth}[t]{l@{\extracolsep{\fill}}r}
       \textbf{\small#1} & {\small #2} \\
       \textit{\small#3} & \textit{\small #4} \\
-    \end{tabular*}\vspace{-4pt}
+    \end{tabular*}\vspace{-5pt}
 }
 
 \newcommand{\resumeProjectHeading}[2]{
-  \vspace{-1pt}\item
+  \vspace{-2pt}\item
     \begin{tabular*}{0.98\textwidth}{l@{\extracolsep{\fill}}r}
       \small#1 & \small#2 \\
-    \end{tabular*}\vspace{-4pt}
+    \end{tabular*}\vspace{-5pt}
 }
 
 \newcommand{\resumeSubItem}[1]{\resumeItem{#1}\vspace{-3pt}}
@@ -75,28 +74,28 @@
 \renewcommand\labelitemii{$\vcenter{\hbox{\tiny$\bullet$}}$}
 
 \newcommand{\resumeSubHeadingListStart}{
-  \begin{itemize}[leftmargin=0.12in, label={}, itemsep=0pt, parsep=0pt, topsep=2pt]
+  \begin{itemize}[leftmargin=0.12in, label={}, itemsep=0pt, parsep=0pt, topsep=1pt]
 }
-\newcommand{\resumeSubHeadingListEnd}{\end{itemize}\vspace{-2pt}}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}\vspace{-3pt}}
 
 \newcommand{\resumeItemListStart}{
-  \begin{itemize}[leftmargin=0.18in, label={\tiny$\bullet$}, itemsep=0pt, parsep=0pt, topsep=2pt]
+  \begin{itemize}[leftmargin=0.18in, label={\tiny$\bullet$}, itemsep=0pt, parsep=0pt, topsep=1pt]
 }
-\newcommand{\resumeItemListEnd}{\end{itemize}\vspace{-4pt}}
+\newcommand{\resumeItemListEnd}{\end{itemize}\vspace{-5pt}}
 
 % ============================================================
 \begin{document}
 
 % ---------- HEADER ----------
 \begin{center}
-    {\large \textbf{\scshape <<FULL_NAME>>}} \\ \vspace{2pt}
+    {\LARGE \textbf{\scshape <<FULL_NAME>>}} \\ \vspace{3pt}
     \small
     <<PHONE>> $\cdot$
     \href{mailto:<<EMAIL>>}{\underline{<<EMAIL>>}} $\cdot$
     \href{<<LINKEDIN>>}{\underline{LinkedIn}} $\cdot$
     \href{<<GITHUB>>}{\underline{GitHub}}
 \end{center}
-\vspace{-6pt}
+\vspace{-8pt}
 
 % ---------- SUMMARY ----------
 \section{Summary}
@@ -123,7 +122,7 @@
 
 % ---------- TECHNICAL SKILLS ----------
 \section{Technical Skills}
- \begin{itemize}[leftmargin=0.12in, label={}, itemsep=1pt, parsep=0pt, topsep=2pt]
+ \begin{itemize}[leftmargin=0.12in, label={}, itemsep=2pt, parsep=0pt, topsep=2pt]
 <<SKILLS_ROWS>>
  \end{itemize}
 
