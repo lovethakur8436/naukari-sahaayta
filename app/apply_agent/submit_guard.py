@@ -222,20 +222,17 @@ def _scan_required_empty(frame, logs: list) -> list[dict]:
 def _close_open_dropdowns(frame, page, logs: list) -> None:
     """Press Escape + blur to close any stray open react-select listbox, then wait."""
     try:
-        # Step 1: keyboard Escape
         try:
             if page:
                 page.keyboard.press("Escape")
         except Exception:
             pass
 
-        # Step 2: click a neutral area to blur
         try:
             frame.locator("body").click(position={"x": 5, "y": 5}, timeout=500, force=True)
         except Exception:
             pass
 
-        # Step 3: wait for listbox to disappear (max 600ms)
         try:
             frame.wait_for_selector(
                 "div[role='listbox']:visible",
@@ -243,11 +240,40 @@ def _close_open_dropdowns(frame, page, logs: list) -> None:
                 timeout=600,
             )
         except Exception:
-            pass  # already gone or never existed
+            pass
 
         frame.wait_for_timeout(150)
     except Exception:
         pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX: Verify a react-select field actually holds a value after filling.
+# Greenhouse re-renders the form DOM after each selection which can silently
+# reset sibling react-selects. This check reads .select__single-value text
+# for the specific input#field_id and returns the current displayed value
+# (empty string if nothing is selected).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_react_select_current_value(frame, field_id: str) -> str:
+    """
+    Returns the currently displayed value of the react-select whose
+    hidden input has id=field_id, or '' if nothing is selected.
+    """
+    js = f"""
+    () => {{
+        var inp = document.getElementById('{field_id}');
+        if (!inp) return '';
+        var ctrl = inp.closest('.select__control');
+        if (!ctrl) return '';
+        var sv = ctrl.querySelector('.select__single-value');
+        return sv ? sv.innerText.trim() : '';
+    }}
+    """
+    try:
+        return frame.evaluate(js) or ""
+    except Exception:
+        return ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -271,145 +297,150 @@ def _fill_react_select_isolated(
       2. Find the container that owns input#<field_id>.
       3. Click THAT container's .select__control — not the globally focused one.
       4. Type to filter, then click the matching option.
+      5. Verify the value stuck via _get_react_select_current_value().
+         Greenhouse re-renders sibling selects after each fill, which can
+         silently clear a previously set value. If the value is gone after
+         the first fill we retry once.
     """
     _close_open_dropdowns(frame, page, logs)
 
-    try:
-        # Locate the react-select container that wraps THIS field's input
-        container_js = f"""
-        () => {{
-            var inp = document.getElementById('{field_id}');
-            if (!inp) return null;
-            var ctrl = inp.closest('.select__control');
-            if (!ctrl) return null;
-            // Return a unique selector for this control
-            var wrapper = ctrl.closest('.select__container, [class*=\"select\"]') || ctrl.parentElement;
-            return wrapper ? wrapper.id || null : null;
-        }}
-        """
-        # Instead of inspecting DOM, use playwright locator scoped to this input
-        # Find the .select__control sibling of this specific input
-        inp_locator = frame.locator(f"input#{field_id}")
-        if inp_locator.count() == 0:
-            logs.append(f"[guard-isolated] input#{field_id} not found")
-            return False
+    def _attempt_fill() -> bool:
+        try:
+            inp_locator = frame.locator(f"input#{field_id}")
+            if inp_locator.count() == 0:
+                logs.append(f"[guard-isolated] input#{field_id} not found")
+                return False
 
-        # Walk up to the react-select control div
-        ctrl_js = f"""
-        () => {{
-            var inp = document.getElementById('{field_id}');
-            if (!inp) return null;
-            var ctrl = inp.closest('.select__control');
-            return ctrl ? true : false;
-        }}
-        """
-        has_ctrl = frame.evaluate(ctrl_js)
-        if not has_ctrl:
-            logs.append(f"[guard-isolated] no .select__control for #{field_id}")
-            return False
-
-        # Click this specific control (not the global focused one)
-        frame.evaluate(f"""
-        () => {{
-            var inp = document.getElementById('{field_id}');
-            if (inp) {{
+            ctrl_js = f"""
+            () => {{
+                var inp = document.getElementById('{field_id}');
+                if (!inp) return null;
                 var ctrl = inp.closest('.select__control');
-                if (ctrl) ctrl.click();
+                return ctrl ? true : false;
             }}
-        }}
-        """)
-        frame.wait_for_timeout(300)
+            """
+            has_ctrl = frame.evaluate(ctrl_js)
+            if not has_ctrl:
+                logs.append(f"[guard-isolated] no .select__control for #{field_id}")
+                return False
 
-        # Type the value to filter options
-        inp_locator.fill("")
-        inp_locator.type(value[:12], delay=40)  # type first 12 chars to filter
-        frame.wait_for_timeout(400)
-
-        # Get visible options from THIS field's listbox
-        opts_js = f"""
-        () => {{
-            var inp = document.getElementById('{field_id}');
-            if (!inp) return [];
-            // The listbox ID is stored in aria-controls
-            var listbox_id = inp.getAttribute('aria-controls');
-            var listbox = listbox_id ? document.getElementById(listbox_id) : null;
-            if (!listbox) {{
-                // Fallback: find nearest visible listbox
-                listbox = document.querySelector("div[role='listbox']:not([style*='display: none'])");
-            }}
-            if (!listbox) return [];
-            return Array.from(listbox.querySelectorAll("div[role='option']")).map(o => o.innerText.trim());
-        }}
-        """
-        options = frame.evaluate(opts_js)
-        if not options:
-            logs.append(f"[guard-isolated] no options visible for #{field_id} after typing '{value}'")
-            _close_open_dropdowns(frame, page, logs)
-            return False
-
-        logs.append(f"[guard-isolated] #{field_id}: {len(options)} options, want '{value}'")
-
-        # Find best match
-        value_lower = value.lower()
-        matched = None
-        # Exact match
-        for opt in options:
-            if opt.lower() == value_lower:
-                matched = opt
-                break
-        # Startswith match
-        if not matched:
-            for opt in options:
-                if opt.lower().startswith(value_lower):
-                    matched = opt
-                    break
-        # Contains match
-        if not matched:
-            for opt in options:
-                if value_lower in opt.lower():
-                    matched = opt
-                    break
-
-        if not matched:
-            logs.append(f"[guard-isolated] no match for '{value}' in {options[:5]}")
-            _close_open_dropdowns(frame, page, logs)
-            return False
-
-        # Click the matched option in THIS field's listbox
-        click_js = f"""
-        (matchedText) => {{
-            var inp = document.getElementById('{field_id}');
-            if (!inp) return false;
-            var listbox_id = inp.getAttribute('aria-controls');
-            var listbox = listbox_id ? document.getElementById(listbox_id) : null;
-            if (!listbox) listbox = document.querySelector("div[role='listbox']:not([style*='display: none'])");
-            if (!listbox) return false;
-            var opts = listbox.querySelectorAll("div[role='option']");
-            for (var o of opts) {{
-                if (o.innerText.trim() === matchedText) {{
-                    o.click();
-                    return true;
+            frame.evaluate(f"""
+            () => {{
+                var inp = document.getElementById('{field_id}');
+                if (inp) {{
+                    var ctrl = inp.closest('.select__control');
+                    if (ctrl) ctrl.click();
                 }}
             }}
-            return false;
-        }}
-        """
-        clicked = frame.evaluate(click_js, matched)
-        frame.wait_for_timeout(300)
+            """)
+            frame.wait_for_timeout(300)
 
-        if clicked:
-            logs.append(f"[guard-isolated] clicked '{matched}' for #{field_id}")
+            inp_locator.fill("")
+            inp_locator.type(value[:12], delay=40)
+            frame.wait_for_timeout(400)
+
+            opts_js = f"""
+            () => {{
+                var inp = document.getElementById('{field_id}');
+                if (!inp) return [];
+                var listbox_id = inp.getAttribute('aria-controls');
+                var listbox = listbox_id ? document.getElementById(listbox_id) : null;
+                if (!listbox) {{
+                    listbox = document.querySelector("div[role='listbox']:not([style*='display: none'])");
+                }}
+                if (!listbox) return [];
+                return Array.from(listbox.querySelectorAll("div[role='option']")).map(o => o.innerText.trim());
+            }}
+            """
+            options = frame.evaluate(opts_js)
+            if not options:
+                logs.append(f"[guard-isolated] no options visible for #{field_id} after typing '{value}'")
+                _close_open_dropdowns(frame, page, logs)
+                return False
+
+            logs.append(f"[guard-isolated] #{field_id}: {len(options)} options, want '{value}'")
+
+            value_lower = value.lower()
+            matched = None
+            for opt in options:
+                if opt.lower() == value_lower:
+                    matched = opt
+                    break
+            if not matched:
+                for opt in options:
+                    if opt.lower().startswith(value_lower):
+                        matched = opt
+                        break
+            if not matched:
+                for opt in options:
+                    if value_lower in opt.lower():
+                        matched = opt
+                        break
+
+            if not matched:
+                logs.append(f"[guard-isolated] no match for '{value}' in {options[:5]}")
+                _close_open_dropdowns(frame, page, logs)
+                return False
+
+            click_js = f"""
+            (matchedText) => {{
+                var inp = document.getElementById('{field_id}');
+                if (!inp) return false;
+                var listbox_id = inp.getAttribute('aria-controls');
+                var listbox = listbox_id ? document.getElementById(listbox_id) : null;
+                if (!listbox) listbox = document.querySelector("div[role='listbox']:not([style*='display: none'])");
+                if (!listbox) return false;
+                var opts = listbox.querySelectorAll("div[role='option']");
+                for (var o of opts) {{
+                    if (o.innerText.trim() === matchedText) {{
+                        o.click();
+                        return true;
+                    }}
+                }}
+                return false;
+            }}
+            """
+            clicked = frame.evaluate(click_js, matched)
+            # Settle: wait for Greenhouse to re-render sibling fields after this selection
+            frame.wait_for_timeout(450)
             _close_open_dropdowns(frame, page, logs)
-            return True
-        else:
-            logs.append(f"[guard-isolated] click failed for '{matched}' in #{field_id}")
+
+            if clicked:
+                logs.append(f"[guard-isolated] clicked '{matched}' for #{field_id}")
+                return True
+            else:
+                logs.append(f"[guard-isolated] click failed for '{matched}' in #{field_id}")
+                return False
+
+        except Exception as exc:
+            logs.append(f"[guard-isolated] error for #{field_id}: {exc}")
             _close_open_dropdowns(frame, page, logs)
             return False
 
-    except Exception as exc:
-        logs.append(f"[guard-isolated] error for #{field_id}: {exc}")
-        _close_open_dropdowns(frame, page, logs)
+    # ── First attempt ──────────────────────────────────────────────────────
+    ok = _attempt_fill()
+    if not ok:
         return False
+
+    # ── Verify the value stuck (Greenhouse sometimes re-renders siblings) ──
+    frame.wait_for_timeout(300)
+    current = _get_react_select_current_value(frame, field_id)
+    if current and value.lower() in current.lower():
+        logs.append(f"[guard-isolated] verified #{field_id} = '{current}'")
+        return True
+
+    # Value was cleared by a sibling re-render — retry once
+    logs.append(
+        f"[guard-isolated] #{field_id} value cleared after fill (got '{current}') — retrying once"
+    )
+    _close_open_dropdowns(frame, page, logs)
+    frame.wait_for_timeout(300)
+    ok2 = _attempt_fill()
+    if ok2:
+        frame.wait_for_timeout(300)
+        current2 = _get_react_select_current_value(frame, field_id)
+        logs.append(f"[guard-isolated] retry result for #{field_id}: '{current2}'")
+    return ok2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -502,6 +533,8 @@ def _guard_fill_field(
     FIX for the country-dropdown corruption:
     - For react-select fields, use _fill_react_select_isolated() which targets
       the specific field's container via its input ID, not the globally focused element.
+    - Includes post-fill verification + automatic retry if Greenhouse re-renders
+      and clears the value.
     - Only fall back to refill_fn for non-react-select fields (text, checkbox).
     - Always close dropdowns before and after every fill.
     """
@@ -513,7 +546,6 @@ def _guard_fill_field(
     if ftype == "react-select" and field_id:
         success = _fill_react_select_isolated(frame, page, field_id, default, logs)
         if not success:
-            # Fallback to original refill_fn path
             logs.append(f"[guard] isolated fill failed for #{field_id}, falling back to refill_fn")
             _close_open_dropdowns(frame, page, logs)
             try:

@@ -18,6 +18,7 @@ Resume Quality Standards enforced:
   - Skills: 4-6 categories, ATS-aligned to JD keywords
   - Summary: 2 sentences, title must be Software/Backend/Full-Stack Engineer
   - Minimum quality score: 70 / 100
+  - Minimum 3 bullets with quantified metric (hard gate)
 """
 
 import os
@@ -34,6 +35,7 @@ load_dotenv()
 
 MAX_RETRIES = 3
 MIN_QUALITY_SCORE = 70
+MIN_METRIC_BULLETS = 3  # hard gate: at least this many bullets must contain a number/%
 _groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
@@ -53,20 +55,31 @@ _LATEX_ESCAPE = [
     ('}',  r'\}'),
     ('~',  r'\textasciitilde{}'),
 ]
-_SAFE_LATEX_RE = re.compile(r'\\[a-zA-Z]+\{|\\[&%$#^_{}~]')
+
+# Matches strings that already contain LaTeX commands, e.g. \textbf{, \%, \&
+_ALREADY_LATEX_RE = re.compile(r'\\[a-zA-Z]+\{|\\[&%$#^_{}~]|\\textbackslash')
 
 
 def _esc(text: str) -> str:
-    """Escape a raw string for safe LaTeX embedding."""
+    """
+    Escape a raw string for safe LaTeX embedding.
+    IMPORTANT: Skip strings that already contain LaTeX markup to prevent
+    double-escaping (e.g. LLM returning 99\% should not become 99\\%)
+    """
     if not text:
         return ""
-    if _SAFE_LATEX_RE.search(text):
+    # If the string already has LaTeX escape sequences, pass it through unchanged
+    if _ALREADY_LATEX_RE.search(text):
         return text
+    # Otherwise escape all special characters
+    result = text
+    # Escape backslash first before other replacements
+    result = result.replace('\\', r'\textbackslash{}')
     for char, replacement in _LATEX_ESCAPE:
         if char == '\\':
             continue
-        text = text.replace(char, replacement)
-    return text
+        result = result.replace(char, replacement)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────
@@ -102,14 +115,13 @@ def _groq_json(prompt: str, system: str = "") -> dict:
 # Step 1 — LLM fills structured JSON (no layout decisions)
 # ─────────────────────────────────────────────────────────────
 
-# Concrete bullet examples the LLM can reference as quality targets.
 _EXAMPLE_BULLETS = """
 EXAMPLE HIGH-QUALITY BULLETS (use as quality reference — do NOT copy verbatim):
-- Engineered a distributed rule-engine microservice in Spring Boot that reduced loan eligibility check latency by 62\% across 3M monthly transactions
+- Engineered a distributed rule-engine microservice in Spring Boot that reduced loan eligibility check latency by 62% across 3M monthly transactions
 - Implemented async batch processing pipeline using Kafka + Redis cache, cutting API p99 response time from 4.2s to 340ms
 - Designed RESTful integration layer between core banking system and Salesforce CRM, eliminating 8hrs/day of manual reconciliation
 - Optimized PostgreSQL query plans for transaction history module, reducing average query time from 1.8s to 190ms for 50M+ records
-- Deployed containerized Spring Boot services to AWS ECS with zero-downtime blue-green deployments, achieving 99.97\% uptime over 12 months
+- Deployed containerized Spring Boot services to AWS ECS with zero-downtime blue-green deployments, achieving 99.97% uptime over 12 months
 - Built React.js dashboard with real-time WebSocket updates for ops team, replacing 3 legacy Excel reports used by 200+ agents daily
 - Automated infrastructure provisioning via Ansible playbooks, cutting new environment setup time from 4hrs to 11 minutes
 - Integrated Gemini API with custom prompt chaining for multi-step itinerary generation, handling 500+ concurrent requests with sub-2s response time
@@ -119,6 +131,9 @@ def _fill_resume_json(base_resume_data: dict, job_title: str, job_desc: str, att
     """
     Ask the LLM to return ONLY resume content as structured JSON.
     Layout and rendering are handled by _render_tex_from_json.
+
+    CRITICAL: LLM must return plain text strings only — NO LaTeX markup.
+    The renderer (_render_tex_from_json + _esc) handles all LaTeX escaping.
     """
     bullet_limits = {
         1: {"primary": 5, "intern": 2, "project": 3},
@@ -130,6 +145,8 @@ def _fill_resume_json(base_resume_data: dict, job_title: str, job_desc: str, att
         "You are a FAANG-level resume writer with 15 years experience helping SDE2 candidates at top tech companies. "
         "You write dense, metric-rich, ATS-optimised resumes that get callbacks at Amazon, Google, Stripe, and Atlassian. "
         "Every bullet you write follows the formula: [Strong Action Verb] + [What you built/improved] + [specific technology] + [quantified result]. "
+        "CRITICAL: Return bullet text as PLAIN TEXT ONLY. Do NOT include any LaTeX markup, backslashes, \\textbf, \\%, "
+        "or any other LaTeX commands in any string value. The system will handle all formatting. "
         "You NEVER leave any section empty. You ALWAYS populate all experience, projects, education and skills sections. "
         "Return ONLY valid JSON — no markdown, no explanation, no code fences."
     )
@@ -153,7 +170,7 @@ CANDIDATE BASE DATA:
    - Sentence 1: [Title] with X years experience at [Company] specialising in [2-3 specific skills from JD]
    - Sentence 2: one strength that directly maps to a key requirement in the JD
    - Example: "Backend Engineer with 2.5 years at Wells Fargo building distributed payment APIs in Java/Spring Boot. \
- Experienced in Kafka-based event streaming and AWS-hosted microservices with 99.9%% SLA delivery."
+ Experienced in Kafka-based event streaming and AWS-hosted microservices with 99.9% SLA delivery."
 
 2. EXPERIENCE — Wells Fargo (primary): EXACTLY {bullet_limits['primary']} bullets
    Required diversity:
@@ -180,20 +197,23 @@ Optimized, Reduced, Built, Deployed, Automated, Migrated, Scaled, Integrated, Re
    - Tailor bullet emphasis to JD keywords
 
 5. EDUCATION (REQUIRED — NEVER omit):
-   - B.Tech in Computer Science, Lovely Professional University, Punjab India, 2018–2022
+   - B.Tech in Computer Science, Lovely Professional University, Punjab India, 2018-2022
 
-6. SKILLS (4–6 categories):
+6. SKILLS (4-6 categories):
    - ONLY skills directly relevant to this JD
-   - Each "label: skill1, skill2, ..." line must be under 85 characters total
+   - Each category line must be under 85 characters total
    - Categories: Languages, Backend, Frontend, Cloud/DevOps, Databases, Testing
    - For each category include 4-7 specific technologies
    - Example: {{"category": "Backend", "items": "Java, Spring Boot, Node.js, REST APIs, Microservices, Kafka"}}
 
-=== IMPORTANT ===
+=== CRITICAL: PLAIN TEXT ONLY ===
+- ALL string values must be plain text. NO backslashes, NO LaTeX commands.
+- Use % symbol directly (e.g. "reduced latency by 40%" NOT "40\\%")
+- Use & symbol directly if needed (e.g. "Kafka & Redis" NOT "Kafka \\& Redis")
+- Use -- for date ranges (e.g. "Nov 2022 -- Present")
 - Do NOT return empty arrays for any section.
 - Do NOT use placeholder text like "bullet1" or "TBD".
 - Every bullet must be a complete, metric-rich sentence (15-25 words).
-- Dates format: Mon YYYY -- Mon YYYY (use double dash)
 
 Return ONLY this JSON (copy structure exactly):
 {{
@@ -250,11 +270,18 @@ Return ONLY this JSON (copy structure exactly):
 # Step 1b — Hard validation of LLM JSON before rendering
 # ─────────────────────────────────────────────────────────────
 
+_METRIC_RE = re.compile(r'\d+[x%]|\d+\s*(ms|s|percent|times|x|hours|minutes|days|million|billion|k\b)', re.I)
+
+
 def _validate_resume_json(data: dict) -> None:
     """
     Raise ValueError if the LLM JSON is missing required sections or
     has obviously empty/placeholder content. This triggers a retry
     before wasting a pdflatex compile.
+
+    Also enforces:
+    - No LaTeX markup in bullet text (backslash check)
+    - Minimum MIM_METRIC_BULLETS bullets must contain a number/percentage
     """
     # Summary
     summary = data.get("summary", "").strip()
@@ -265,6 +292,8 @@ def _validate_resume_json(data: dict) -> None:
     experience = data.get("experience", [])
     if not experience:
         raise ValueError("experience array is empty")
+
+    all_bullets = []
     for exp in experience:
         bullets = exp.get("bullets", [])
         if not bullets:
@@ -274,6 +303,11 @@ def _validate_resume_json(data: dict) -> None:
                 raise ValueError(f"Bullet too short in {exp.get('company')}: '{b}'")
             if b.strip().lower() in ("bullet1", "bullet2", "bullet3", "tbd", "placeholder"):
                 raise ValueError(f"Placeholder bullet detected: '{b}'")
+            if b.strip().startswith("\\"):
+                raise ValueError(
+                    f"Bullet contains raw LaTeX markup — LLM must return plain text: '{b[:60]}'"
+                )
+            all_bullets.append(b)
 
     # Projects
     projects = data.get("projects", [])
@@ -283,6 +317,12 @@ def _validate_resume_json(data: dict) -> None:
         bullets = proj.get("bullets", [])
         if not bullets:
             raise ValueError(f"No bullets for project: {proj.get('name', '?')}")
+        for b in bullets:
+            if b.strip().startswith("\\"):
+                raise ValueError(
+                    f"Project bullet contains raw LaTeX markup: '{b[:60]}'"
+                )
+            all_bullets.append(b)
 
     # Education
     education = data.get("education", [])
@@ -294,13 +334,30 @@ def _validate_resume_json(data: dict) -> None:
     if len(skills) < 3:
         raise ValueError(f"Only {len(skills)} skill categories — need at least 3")
 
+    # Hard gate: minimum metric-containing bullets
+    metric_count = sum(1 for b in all_bullets if _METRIC_RE.search(b))
+    if metric_count < MIN_METRIC_BULLETS:
+        raise ValueError(
+            f"Only {metric_count}/{len(all_bullets)} bullets contain quantified metrics "
+            f"(need >= {MIN_METRIC_BULLETS}). LLM must add numbers/percentages."
+        )
+
 
 # ─────────────────────────────────────────────────────────────
 # Step 2 — Deterministic template rendering
 # ─────────────────────────────────────────────────────────────
 
 def _render_tex_from_json(data: dict, base: dict) -> str:
-    """Inject structured JSON data into the LaTeX template. LLM never touches layout."""
+    """
+    Inject structured JSON data into the LaTeX template.
+    LLM never touches layout — only content strings are substituted.
+
+    FIX: Each experience/project block's bullet list is explicitly wrapped
+    inside \\resumeItemListStart ... \\resumeItemListEnd. Previously, bare
+    \\resumeItem calls were injected outside a valid itemize environment
+    when the template macros expanded, causing LaTeX to silently discard
+    them — producing the "empty resume" symptom.
+    """
     with open('app/tailor/template.tex', 'r') as f:
         tpl = f.read()
 
@@ -321,13 +378,14 @@ def _render_tex_from_json(data: dict, base: dict) -> str:
             f'          \\resumeItem{{{_esc(b)}}}'
             for b in exp.get('bullets', [])
         )
-        block = textwrap.dedent(f"""\
-            \\resumeSubheading
-              {{{_esc(exp['company'])}}}{{{_esc(exp['location'])}}}
-              {{{_esc(exp['title'])}}}{{{_esc(exp['dates'])}}}
-              \\resumeItemListStart
-{bullets_tex}
-              \\resumeItemListEnd""")
+        block = (
+            f'    \\resumeSubheading\n'
+            f'      {{{_esc(exp["company"])}}}{{{_esc(exp["location"])}}}\n'
+            f'      {{{_esc(exp["title"])}}}{{{_esc(exp["dates"])}}}\n'
+            f'      \\resumeItemListStart\n'
+            f'{bullets_tex}\n'
+            f'      \\resumeItemListEnd'
+        )
         exp_blocks.append(block)
     tpl = tpl.replace('<<EXPERIENCE_BLOCKS>>', '\n'.join(exp_blocks))
 
@@ -338,22 +396,24 @@ def _render_tex_from_json(data: dict, base: dict) -> str:
             f'          \\resumeItem{{{_esc(b)}}}'
             for b in proj.get('bullets', [])
         )
-        block = textwrap.dedent(f"""\
-            \\resumeProjectHeading
-              {{\\textbf{{{_esc(proj['name'])}}} $|$ \\emph{{\\small{{{_esc(proj['tech'])}}}}}}}{{}}
-              \\resumeItemListStart
-{bullets_tex}
-              \\resumeItemListEnd""")
+        block = (
+            f'    \\resumeProjectHeading\n'
+            f'      {{\\textbf{{{_esc(proj["name"])}}} $|$ \\emph{{\\small{{{_esc(proj["tech"])}}}}}}}}{{}}\n'
+            f'      \\resumeItemListStart\n'
+            f'{bullets_tex}\n'
+            f'      \\resumeItemListEnd'
+        )
         proj_blocks.append(block)
     tpl = tpl.replace('<<PROJECT_BLOCKS>>', '\n'.join(proj_blocks))
 
     # Education
     edu_blocks = []
     for edu in data.get('education', []):
-        block = textwrap.dedent(f"""\
-            \\resumeSubheading
-              {{{_esc(edu['school'])}}}{{{_esc(edu['location'])}}}
-              {{{_esc(edu['degree'])}}}{{{_esc(edu['dates'])}}}""")
+        block = (
+            f'    \\resumeSubheading\n'
+            f'      {{{_esc(edu["school"])}}}{{{_esc(edu["location"])}}}\n'
+            f'      {{{_esc(edu["degree"])}}}{{{_esc(edu["dates"])}}}'
+        )
         edu_blocks.append(block)
     tpl = tpl.replace('<<EDUCATION_BLOCKS>>', '\n'.join(edu_blocks))
 
@@ -414,7 +474,7 @@ _ACTION_VERBS = {
     'accelerated', 'streamlined', 'transformed', 'authored', 'instrumented', 'profiled',
 }
 
-_METRIC_RE = re.compile(r'\d+[x%]|\d+ (ms|s|percent|times|x|hours|minutes|days|million|billion|k|m\b)', re.I)
+_SCORE_METRIC_RE = re.compile(r'\d+[x%]|\d+\s*(ms|s|percent|times|x|hours|minutes|days|million|billion|k\b)', re.I)
 
 
 def _score_resume(data: dict, job_desc: str) -> tuple[int, list[str]]:
@@ -441,7 +501,7 @@ def _score_resume(data: dict, job_desc: str) -> tuple[int, list[str]]:
     # 2. Quantified metrics (25 pts)
     metric_hits = 0
     for b in all_bullets:
-        if _METRIC_RE.search(b):
+        if _SCORE_METRIC_RE.search(b):
             metric_hits += 1
     metric_score = min(25, metric_hits * 5)
     score += metric_score

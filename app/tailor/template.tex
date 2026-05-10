@@ -44,9 +44,8 @@
 \setlength{\parsep}{0pt}
 
 % ---------- Section formatting ----------
-% Dense horizontal rule under each section heading
 \titleformat{\section}{
-  \vspace{-6pt}\scshape\raggedright\normalsize\bfseries
+  \vspace{-4pt}\scshape\raggedright\normalsize\bfseries
 }{}{0em}{}[\color{black}\titlerule \vspace{-4pt}]
 
 % ---------- Custom commands ----------
@@ -61,14 +60,14 @@
     \begin{tabular*}{0.98\textwidth}[t]{l@{\extracolsep{\fill}}r}
       \textbf{\small#1} & {\small #2} \\
       \textit{\small#3} & \textit{\small #4} \\
-    \end{tabular*}\vspace{-6pt}
+    \end{tabular*}\vspace{-4pt}
 }
 
 \newcommand{\resumeProjectHeading}[2]{
   \vspace{-1pt}\item
     \begin{tabular*}{0.98\textwidth}{l@{\extracolsep{\fill}}r}
       \small#1 & \small#2 \\
-    \end{tabular*}\vspace{-6pt}
+    \end{tabular*}\vspace{-4pt}
 }
 
 \newcommand{\resumeSubItem}[1]{\resumeItem{#1}\vspace{-3pt}}
