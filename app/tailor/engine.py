@@ -38,6 +38,20 @@ MIN_QUALITY_SCORE = 70
 MIN_METRIC_BULLETS = 3  # hard gate: at least this many bullets must contain a number/%
 _groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
+# ─────────────────────────────────────────────────────────────
+# GROUND-TRUTH CANDIDATE DATA — never overridden by LLM
+# ─────────────────────────────────────────────────────────────
+# Education is hardcoded here so the LLM can NEVER hallucinate it.
+# _render_tex_from_json ignores whatever the LLM returns for education
+# and always uses these values directly.
+_EDUCATION_GROUND_TRUTH = [
+    {
+        "school":   "Dr. A.P.J. Abdul Kalam Technical University",
+        "location": "Lucknow, India",
+        "degree":   "Bachelor of Technology, Computer Science Engineering",
+        "dates":    "2018 -- 2022",
+    }
+]
 
 # ─────────────────────────────────────────────────────────────
 # LaTeX safety
@@ -134,11 +148,20 @@ def _fill_resume_json(base_resume_data: dict, job_title: str, job_desc: str, att
 
     CRITICAL: LLM must return plain text strings only — NO LaTeX markup.
     The renderer (_render_tex_from_json + _esc) handles all LaTeX escaping.
+
+    NOTE: Education is NOT sent to the LLM for generation — it is hardcoded
+    in _EDUCATION_GROUND_TRUTH and injected directly by the renderer.
+    The LLM JSON schema still includes an education placeholder so the
+    validator doesn't fail, but the renderer always overrides it.
     """
+    # FIX 2: tighter bullet limits to prevent 2-page overflow.
+    # Attempt 1: 4 primary bullets, 2 project bullets per project
+    # Attempt 2: 3 primary bullets, 2 project bullets per project
+    # Attempt 3: 3 primary bullets, 1 project bullet per project
     bullet_limits = {
-        1: {"primary": 5, "intern": 2, "project": 3},
-        2: {"primary": 4, "intern": 2, "project": 2},
-        3: {"primary": 4, "intern": 1, "project": 2},
+        1: {"primary": 4, "intern": 2, "project": 2},
+        2: {"primary": 3, "intern": 1, "project": 2},
+        3: {"primary": 3, "intern": 1, "project": 1},
     }[min(attempt, 3)]
 
     system_prompt = (
@@ -147,7 +170,7 @@ def _fill_resume_json(base_resume_data: dict, job_title: str, job_desc: str, att
         "Every bullet you write follows the formula: [Strong Action Verb] + [What you built/improved] + [specific technology] + [quantified result]. "
         "CRITICAL: Return bullet text as PLAIN TEXT ONLY. Do NOT include any LaTeX markup, backslashes, \\textbf, \\%, "
         "or any other LaTeX commands in any string value. The system will handle all formatting. "
-        "You NEVER leave any section empty. You ALWAYS populate all experience, projects, education and skills sections. "
+        "You NEVER leave any section empty. You ALWAYS populate all experience, projects, and skills sections. "
         "Return ONLY valid JSON — no markdown, no explanation, no code fences."
     )
 
@@ -170,15 +193,14 @@ CANDIDATE BASE DATA:
    - Sentence 1: [Title] with X years experience at [Company] specialising in [2-3 specific skills from JD]
    - Sentence 2: one strength that directly maps to a key requirement in the JD
    - Example: "Backend Engineer with 2.5 years at Wells Fargo building distributed payment APIs in Java/Spring Boot. \
- Experienced in Kafka-based event streaming and AWS-hosted microservices with 99.9% SLA delivery."
+Experienced in Kafka-based event streaming and AWS-hosted microservices with 99.9% SLA delivery."
 
 2. EXPERIENCE — Wells Fargo (primary): EXACTLY {bullet_limits['primary']} bullets
    Required diversity:
    - Bullet 1: system/service you designed or engineered (latency or scale metric)
    - Bullet 2: integration or API work (throughput or adoption metric)
    - Bullet 3: performance optimization (before/after numbers)
-   - Bullet 4: reliability/availability or deployment work (uptime or incident metric)
-   - Bullet 5 (if applicable): process/automation improvement (time saved metric)
+   - Bullet 4 (if applicable): reliability/availability or deployment work (uptime or incident metric)
    - Mirror 2-3 exact phrases from the JD
    - ALL bullets must start with a DIFFERENT strong action verb from: Designed, Engineered, Implemented, \
 Optimized, Reduced, Built, Deployed, Automated, Migrated, Scaled, Integrated, Refactored, Delivered, Launched
@@ -189,15 +211,15 @@ Optimized, Reduced, Built, Deployed, Automated, Migrated, Scaled, Integrated, Re
 4. PROJECTS: EXACTLY 2 projects
    Project 1 — AI Trip Planner:
      Tech: Gemini API | React.js | Firebase
-     Write {bullet_limits['project']} bullets covering: AI integration, user-facing feature, scale/performance
+     Write {bullet_limits['project']} bullet(s) covering: AI integration, user-facing feature, scale/performance
    Project 2 — InfraBoard (Ansible Ops Dashboard):
      Tech: FastAPI | React.js | MongoDB | Docker | AWS EC2
-     Write {bullet_limits['project']} bullets covering: backend architecture, automation benefit, ops improvement
+     Write {bullet_limits['project']} bullet(s) covering: backend architecture, automation benefit, ops improvement
    - Present as shipped/production work — no "In Progress" labels
    - Tailor bullet emphasis to JD keywords
 
-5. EDUCATION (REQUIRED — NEVER omit):
-   - B.Tech in Computer Science, Lovely Professional University, Punjab India, 2018-2022
+5. EDUCATION — DO NOT GENERATE. Return the placeholder exactly as shown below.
+   The system will inject the correct education details automatically.
 
 6. SKILLS (4-6 categories):
    - ONLY skills directly relevant to this JD
@@ -224,34 +246,34 @@ Return ONLY this JSON (copy structure exactly):
       "location": "Hyderabad, India",
       "title": "Software Engineer",
       "dates": "Nov 2022 -- Present",
-      "bullets": ["<bullet1>", "<bullet2>", "<bullet3>", "<bullet4>"]
+      "bullets": ["<bullet1>", "<bullet2>", "<bullet3>"]
     }},
     {{
       "company": "Airveda",
       "location": "Remote",
       "title": "Software Engineer Intern",
       "dates": "Mar 2022 -- May 2022",
-      "bullets": ["<bullet1>", "<bullet2>"]
+      "bullets": ["<bullet1>"]
     }}
   ],
   "projects": [
     {{
       "name": "AI Trip Planner",
       "tech": "Gemini API | React.js | Firebase",
-      "bullets": ["<bullet1>", "<bullet2>", "<bullet3>"]
+      "bullets": ["<bullet1>", "<bullet2>"]
     }},
     {{
       "name": "InfraBoard -- Ansible Ops Dashboard",
       "tech": "FastAPI | React.js | MongoDB | Docker | AWS EC2",
-      "bullets": ["<bullet1>", "<bullet2>", "<bullet3>"]
+      "bullets": ["<bullet1>", "<bullet2>"]
     }}
   ],
   "education": [
     {{
-      "degree": "B.Tech in Computer Science",
-      "school": "Lovely Professional University",
-      "location": "Punjab, India",
-      "dates": "2018 -- 2022"
+      "degree": "PLACEHOLDER",
+      "school": "PLACEHOLDER",
+      "location": "PLACEHOLDER",
+      "dates": "PLACEHOLDER"
     }}
   ],
   "skills": [
@@ -282,6 +304,9 @@ def _validate_resume_json(data: dict) -> None:
     Also enforces:
     - No LaTeX markup in bullet text (backslash check)
     - Minimum MIM_METRIC_BULLETS bullets must contain a number/percentage
+
+    NOTE: Education validation is intentionally lenient here — the renderer
+    always uses _EDUCATION_GROUND_TRUTH regardless of what the LLM returns.
     """
     # Summary
     summary = data.get("summary", "").strip()
@@ -324,10 +349,10 @@ def _validate_resume_json(data: dict) -> None:
                 )
             all_bullets.append(b)
 
-    # Education
-    education = data.get("education", [])
-    if not education:
-        raise ValueError("education array is empty — LLM omitted it")
+    # Education — only check the key exists; content is always overridden
+    # by _EDUCATION_GROUND_TRUTH in the renderer so we don't validate values.
+    if "education" not in data:
+        raise ValueError("education key missing from LLM response")
 
     # Skills
     skills = data.get("skills", [])
@@ -352,11 +377,12 @@ def _render_tex_from_json(data: dict, base: dict) -> str:
     Inject structured JSON data into the LaTeX template.
     LLM never touches layout — only content strings are substituted.
 
-    FIX: Each experience/project block's bullet list is explicitly wrapped
-    inside \\resumeItemListStart ... \\resumeItemListEnd. Previously, bare
-    \\resumeItem calls were injected outside a valid itemize environment
-    when the template macros expanded, causing LaTeX to silently discard
-    them — producing the "empty resume" symptom.
+    FIX 1 (education): Always uses _EDUCATION_GROUND_TRUTH — the LLM's
+    education array is completely ignored. This prevents any hallucination
+    of the university name, degree, location, or dates.
+
+    FIX 2 (page overflow): Each experience/project block's bullet list is
+    explicitly wrapped inside \\resumeItemListStart ... \\resumeItemListEnd.
     """
     with open('app/tailor/template.tex', 'r') as f:
         tpl = f.read()
@@ -389,9 +415,7 @@ def _render_tex_from_json(data: dict, base: dict) -> str:
         exp_blocks.append(block)
     tpl = tpl.replace('<<EXPERIENCE_BLOCKS>>', '\n'.join(exp_blocks))
 
-    # Projects — FIX: build the heading line via string concatenation, not a
-    # single f-string, to avoid the brace-counting SyntaxError Python 3.12+
-    # raises when LaTeX double-braces and f-string braces are deeply nested.
+    # Projects
     proj_blocks = []
     for proj in data.get('projects', []):
         bullets_tex = '\n'.join(
@@ -400,10 +424,9 @@ def _render_tex_from_json(data: dict, base: dict) -> str:
         )
         name_esc = _esc(proj["name"])
         tech_esc = _esc(proj["tech"])
-        # Build the \resumeProjectHeading line as a plain string — no nested f-string braces
         heading_line = (
             '    \\resumeProjectHeading\n'
-            '      {\\textbf{' + name_esc + '} $|$ \\emph{\\small{' + tech_esc + '}}}{}\n'
+            '      {\\textbf{' + name_esc + '} $|$ \\emph{\\small{' + tech_esc + '}}}{}\\n'
         )
         block = (
             heading_line
@@ -414,9 +437,9 @@ def _render_tex_from_json(data: dict, base: dict) -> str:
         proj_blocks.append(block)
     tpl = tpl.replace('<<PROJECT_BLOCKS>>', '\n'.join(proj_blocks))
 
-    # Education
+    # FIX 1: Education — always use ground-truth data, never the LLM's output.
     edu_blocks = []
-    for edu in data.get('education', []):
+    for edu in _EDUCATION_GROUND_TRUTH:
         block = (
             f'    \\resumeSubheading\n'
             f'      {{{_esc(edu["school"])}}}{{{_esc(edu["location"])}}}\n'
@@ -428,7 +451,7 @@ def _render_tex_from_json(data: dict, base: dict) -> str:
     # Skills
     skill_rows = []
     for sk in data.get('skills', []):
-        row = f'    \\small{{\\textbf{{{_esc(sk["category"])}:}} {_esc(sk["items"])}}}'
+        row = f'    \\small{{\\textbf{{{_esc(sk["category"])}: }} {_esc(sk["items"])}}}'
         skill_rows.append(f'  \\item {row}')
     tpl = tpl.replace('<<SKILLS_ROWS>>', '\n'.join(skill_rows))
 
