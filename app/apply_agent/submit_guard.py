@@ -4,18 +4,8 @@ submit_guard.py
 Three-layer safety net around form submission:
 
   Layer 1 — SAFE_DEFAULTS
-    When the LLM returns null/empty for a field, check whether the field
-    is required. If so, look up a sensible default answer keyed on the
-    field label pattern and apply it instead of silently skipping.
-
   Layer 2 — Pre-Submit Scan (_scan_required_empty)
-    Before clicking Submit, walk every required field and check if it is
-    still visually empty. Re-fill anything missed.
-
   Layer 3 — Post-Submit Retry (submit_with_retry)
-    After clicking Submit, detect validation error messages. Parse which
-    fields are highlighted and attempt a targeted re-fill. Retry up to
-    MAX_SUBMIT_RETRIES times before giving up.
 """
 
 from __future__ import annotations
@@ -28,128 +18,72 @@ if TYPE_CHECKING:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Layer 1 — SAFE_DEFAULTS
-# Keys are regex patterns matched against the lowercase field label.
-# Values are the answer to use when LLM returns null for a REQUIRED field.
-# List values = checkbox groups (pick the first matching option).
 # ─────────────────────────────────────────────────────────────────────────────
 
 SAFE_DEFAULTS: list[tuple[str, str | list]] = [
-    # ── Experience / seniority ────────────────────────────────────────────
     (r"years.{0,20}experience|experience.{0,20}years",  "3-4 years"),
     (r"how many years",                                  "3-4 years"),
     (r"level of experience|seniority",                   "Mid-level"),
-
-    # ── Specialization / domain checkboxes ───────────────────────────────
     (r"specializ|area.{0,15}work|domain",               ["Backend", "Full-Stack"]),
     (r"which.{0,20}area",                               ["Backend"]),
-
-    # ── Programming languages checkboxes ─────────────────────────────────
     (r"language|tech.?stack|primary.{0,10}language",    ["Python", "Java"]),
-
-    # ── Pronouns ──────────────────────────────────────────────────────────
     (r"pronoun",                                         "he/him/his"),
-
-    # ── Portfolio / personal site ─────────────────────────────────────────
     (r"portfolio|personal.?site|website",               "https://github.com/lovethakur8436"),
-
-    # ── Cover letter / motivation ─────────────────────────────────────────
     (r"cover.?letter|why.{0,20}(us|company|role)|motivation|interested in",
      "I am excited about this opportunity and believe my skills in backend engineering "
      "and API development align well with the role."),
-
-    # ── Salary / compensation ─────────────────────────────────────────────
     (r"salary|compensation|expected.{0,10}pay",          "Open to discussion"),
-
-    # ── Notice period / availability ──────────────────────────────────────
     (r"notice.?period|start.?date|when.{0,15}start|available", "30 days"),
-
-    # ── Relocation ────────────────────────────────────────────────────────
     (r"relocat",                                         "Yes"),
-
-    # ── Visa / sponsorship — candidate does NOT need sponsorship ─────────
     (r"sponsor|visa",                                    "No"),
-
-    # ── Work authorization ────────────────────────────────────────────────
     (r"authoriz.{0,30}work|work.{0,30}authoriz|eligible.{0,20}work",
      ["Yes", "Yes, I am authorized", "Authorized to work"]),
-
-    # ── Remote preference ────────────────────────────────────────────────
     (r"remote|work.{0,10}(from|preference|location)|plan.{0,10}work.{0,10}remote",
      "__REMOTE_PICK__"),
-
-    # ── Referral / how did you hear ───────────────────────────────────────
     (r"how.{0,20}hear|referr|source",                    "LinkedIn"),
-
-    # ── Preferred contact / communication ────────────────────────────────
     (r"preferred.{0,15}contact|best.{0,10}way",          "Email"),
-
-    # ── Current / previous employer ───────────────────────────────────────
     (r"current.{0,15}(company|employer)|previous.{0,15}(company|employer)|who is your current",
      "N/A"),
-
-    # ── Current / previous job title ─────────────────────────────────────
     (r"job.?title|current.{0,15}title|previous.{0,15}title",
      "Software Engineer"),
-
-    # ── Previously employed at THIS company ───────────────────────────────
     (r"(previously|ever|before).{0,30}(employ|work).{0,30}(stripe|company|us|affiliate)"
      r"|(employ|work).{0,30}(stripe|company|us|affiliate).{0,30}(previously|before|ever)",
      ["No", "No, I have not"]),
-
-    # ── Education: school attended ───────────────────────────────────────
     (r"school|universit|college|institution|attended",
      "Maharshi Dayanand University"),
-
-    # ── Education: degree obtained ────────────────────────────────────────
     (r"degree|qualification|highest.{0,15}education",
      ["Bachelor", "Bachelor's", "B.Tech", "Bachelor of Technology",
       "Bachelors", "B.E.", "B.Sc", "Undergraduate"]),
-
-    # ── Location / city ──────────────────────────────────────────────────
+    # location city — plain text, not react-select
     (r"location.{0,15}city|city.{0,15}reside|current.{0,15}city|location \(city\)",
      "Hyderabad"),
-
-    # ── Country of residence (Stripe custom questions) ────────────────────
+    # country of residence
     (r"country.{0,30}(reside|live|located|based)"
      r"|(reside|live|located|based).{0,30}country"
      r"|country where you currently",
      ["India", "India (IN)", "IN"]),
-
-    # ── Countries anticipating working in (checkbox group) ────────────────
+    # countries anticipating working in — checkbox group, India only
     (r"countr.{0,30}(anticipat|plan|intend).{0,30}work"
      r"|(anticipat|plan|intend).{0,30}countr.{0,30}work"
      r"|countr.{0,10}(you|to).{0,10}(work|apply)",
      ["India", "India (IN)", "IN"]),
-
-    # ── WhatsApp / messaging opt-in ───────────────────────────────────────
     (r"whatsapp|opt.{0,10}(in|out).{0,20}(message|receiv|sms)"
      r"|(message|receiv|sms).{0,20}opt.{0,10}(in|out)",
      ["No", "No, I do not opt-in", "I do not consent"]),
-
-    # ── BrightHire / interview recording consent ──────────────────────────
     (r"brighthire|record.{0,30}(interview|transcrib)"
      r"|(interview|transcrib).{0,30}record"
      r"|consent.{0,20}(record|transcrib|interview)",
      ["Yes", "I consent", "Yes, I consent"]),
-
-    # ── Generic yes/no ────────────────────────────────────────────────────
-    (r"non.?compete|employment.?agreement|reasonable.?accommodation",
+    (r"non.?compete|employment.?agreement|reasonable.{0,20}accommodation",
      ["No", "No, I do not"]),
-
-    # ── US city/state (skip if not in US) ────────────────────────────────
     (r"(city|state).{0,15}(reside|located).{0,15}us"
      r"|if located in the us",
      "N/A"),
-
-    # ── LinkedIn fallback ─────────────────────────────────────────────────
     (r"linkedin",                                        "linkedin.com/in/luv-kumar-06975b175"),
-
-    # ── GitHub fallback ───────────────────────────────────────────────────
     (r"github",                                          "https://github.com/lovethakur8436"),
 ]
 
 
-# Sentinel value
 _REMOTE_SENTINEL = "__REMOTE_PICK__"
 
 _REMOTE_PREFERENCE_KEYWORDS = [
@@ -199,22 +133,11 @@ def get_safe_default(label: str, options: list[str] | None = None) -> str | None
 # Layer 2 — Pre-Submit Empty-Required Field Scan
 # ─────────────────────────────────────────────────────────────────────────────
 
-_ERROR_FIELD_SELECTORS = (
-    ".field_with_errors input, .field_with_errors textarea, "
-    "[aria-invalid='true'], "
-    "input.error, textarea.error"
-)
-
-# FIX: react-select check now inspects the VALUE container (.select__single-value
-# or .select__multi-value), not just the presence of .select__placeholder.
-# A placeholder div can be hidden (display:none) while the field still shows
-# as empty to the JS scan — causing false-positive "empty" reports on fields
-# that were already correctly filled in the first pass.
 _SCAN_REQUIRED_JS = (
     "() => {"
-    "  const skip = new Set(['first_name','last_name','email','phone','country']);"
-    "  const empty = [];"
-    # text / textarea
+    "  var skip = new Set(['first_name','last_name','email','phone','country']);"
+    "  var empty = [];"
+    # ── text / textarea ──────────────────────────────────────────────────
     "  document.querySelectorAll("
     "    'input[type=\"text\"]:not([hidden]), textarea:not([hidden])'"
     "  ).forEach(function(el) {"
@@ -226,13 +149,16 @@ _SCAN_REQUIRED_JS = (
     "            && document.querySelector('label[for=\"' + el.id + '\"]').innerText.includes('*'));"
     "    if (!req) return;"
     "    if ((el.value || '').trim() !== '') return;"
-    # Skip candidate-location here — it is a Google Places typeahead handled separately
-    "    if (el.id === 'candidate-location') return;"
+    # FIX: candidate-location is handled by _fill_location_typeahead.
+    # Remove it from the scan so submitGuard doesn't try to re-fill it
+    # via react-select (which was causing the Australia/Hyderabad corruption).
+    # We only re-fill it via the dedicated typeahead path below.
+    "    if (el.id === 'candidate-location') { empty.push({ id: el.id, name: el.name, label: 'Location (City)', type: 'location-typeahead' }); return; }"
     "    var lbl = (document.querySelector('label[for=\"' + el.id + '\"]') || {}).innerText || '';"
     "    lbl = lbl.replace('*','').trim() || el.placeholder || el.name || el.id;"
     "    empty.push({ id: el.id, name: el.name, label: lbl, type: 'text' });"
     "  });"
-    # react-select combobox — FIX: use value container, not placeholder
+    # ── react-select combobox — check value container, not placeholder ───
     "  document.querySelectorAll('input[role=\"combobox\"]').forEach(function(el) {"
     "    if (skip.has(el.id)) return;"
     "    if (el.offsetWidth === 0 && el.offsetHeight === 0) return;"
@@ -243,15 +169,13 @@ _SCAN_REQUIRED_JS = (
     "    if (!req) return;"
     "    var control = el.closest('.select__control');"
     "    if (!control) return;"
-    # A filled react-select has .select__single-value or .select__multi-value
-    # Only flag as empty when NEITHER value element is present
     "    var hasValue = control.querySelector('.select__single-value, .select__multi-value');"
     "    if (hasValue) return;"
     "    var lbl = (document.querySelector('label[for=\"' + el.id + '\"]') || {}).innerText || '';"
     "    lbl = lbl.replace('*','').trim() || el.name || el.id;"
     "    empty.push({ id: el.id, name: el.name, label: lbl, type: 'react-select' });"
     "  });"
-    # file input
+    # ── file input ───────────────────────────────────────────────────────
     "  document.querySelectorAll('input[type=\"file\"]').forEach(function(el) {"
     "    if (el.offsetWidth === 0 && el.offsetHeight === 0) return;"
     "    var req = el.required || el.getAttribute('aria-required') === 'true';"
@@ -259,7 +183,7 @@ _SCAN_REQUIRED_JS = (
     "    if (el.files && el.files.length > 0) return;"
     "    empty.push({ id: el.id, name: el.name, label: 'Resume/CV', type: 'file' });"
     "  });"
-    # checkbox groups
+    # ── checkbox groups ──────────────────────────────────────────────────
     "  var groups = {};"
     "  document.querySelectorAll('input[type=\"checkbox\"]').forEach(function(el) {"
     "    if (el.offsetWidth === 0 && el.offsetHeight === 0) return;"
@@ -287,6 +211,34 @@ def _scan_required_empty(frame, logs: list) -> list[dict]:
     except Exception as exc:
         logs.append(f"[submit_guard] _scan_required_empty error: {exc}")
         return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Escape any open react-select dropdown before the next fill
+# FIX ROOT CAUSE: After filling a react-select (e.g. country = India), the
+# listbox sometimes stays open/focused. The NEXT react-select fill then calls
+# control_div.click() which re-opens the SAME already-focused dropdown instead
+# of the new field's dropdown — causing every subsequent value to be typed
+# into the country field (producing 'Australia', 'Yes', 'No' in country).
+# Solution: always Escape + blur before starting the next field fill.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _close_open_dropdowns(frame, page, logs: list) -> None:
+    """Press Escape + click body to close any stray open react-select listbox."""
+    try:
+        open_listbox = frame.locator("div[role='listbox']:visible")
+        if open_listbox.count() > 0:
+            try:
+                if page:
+                    page.keyboard.press("Escape")
+                else:
+                    frame.locator("body").click(position={"x": 5, "y": 5}, timeout=800)
+            except Exception:
+                pass
+            frame.wait_for_timeout(200)
+            logs.append("[submit_guard] Closed stray open dropdown before refill")
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -364,32 +316,6 @@ def _wait_outcome(page, frame, pre_url: str, logs: list, wait_s: float = 8) -> s
     return "FAILED"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Escape any open react-select dropdown before proceeding to the next field
-# FIX: The root cause of "typing 'Yes' into question_60419386" was that the
-# country dropdown was left open after being filled. Every subsequent
-# _fill_react_select call was opening that same focused dropdown instead of
-# its own. We now close any open listbox before each fill.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _close_open_dropdowns(frame, page, logs: list) -> None:
-    """Press Escape + click body to close any stray open react-select listbox."""
-    try:
-        open_listbox = frame.locator("div[role='listbox']:visible")
-        if open_listbox.count() > 0:
-            try:
-                if page:
-                    page.keyboard.press("Escape")
-                else:
-                    frame.locator("body").click(position={"x": 5, "y": 5}, timeout=800)
-            except Exception:
-                pass
-            frame.wait_for_timeout(200)
-            logs.append("[submit_guard] Closed stray open dropdown before refill")
-    except Exception:
-        pass
-
-
 def submit_with_retry(
     page,
     frame,
@@ -416,6 +342,7 @@ def submit_with_retry(
             for ef in empty_fields:
                 ftype = ef.get("type")
 
+                # ── Resume re-upload ────────────────────────────────────
                 if ftype == "file" and resume_path:
                     try:
                         frame.locator("input[type='file']").first.set_input_files(resume_path)
@@ -424,8 +351,28 @@ def submit_with_retry(
                         logs.append(f"[submit_guard] Resume re-upload failed: {exc}")
                     continue
 
-                # FIX: Close any stray open dropdown BEFORE filling the next field
-                # to prevent the previous react-select from swallowing the next fill
+                # ── location-typeahead: use dedicated helper, not react-select ──
+                # FIX BUG 2: candidate-location must be filled by the typeahead
+                # helper (which types slowly and waits for suggestions), not by
+                # the generic react-select path which targets the wrong element.
+                if ftype == "location-typeahead" or ef.get("id") == "candidate-location":
+                    try:
+                        city = candidate_profile.get("location", "Hyderabad, India").split(",")[0].strip()
+                        refill_fn(
+                            frame,
+                            {"id": "candidate-location", "type": "text", "name": ""},
+                            city,
+                            logs,
+                            page,
+                        )
+                    except Exception as exc:
+                        logs.append(f"[submit_guard] location typeahead refill error: {exc}")
+                    continue
+
+                # FIX BUG 1: ALWAYS close any open dropdown BEFORE filling
+                # the next field. Without this, the previously-focused country
+                # dropdown stays open and swallows the next field's fill —
+                # causing 'Australia', 'Yes', 'No' to land in the country field.
                 _close_open_dropdowns(frame, page, logs)
 
                 field_info = next(
@@ -465,17 +412,28 @@ def submit_with_retry(
                         f"[submit_guard] Applying safe default for '{ef['label']}' "
                         f"(id={ef['id']}): '{default}'"
                     )
+                    # FIX BUG 1 (continued): Close dropdown AGAIN just before
+                    # calling refill_fn — a prior field's click can re-open it.
+                    _close_open_dropdowns(frame, page, logs)
                     try:
                         refill_fn(frame, field_info, default, logs, page)
                     except Exception as exc:
                         logs.append(f"[submit_guard] refill_fn error for '{ef['id']}': {exc}")
+                    # FIX BUG 1: Press Escape after every refill_fn call to
+                    # ensure the dropdown is closed before the next iteration.
+                    try:
+                        if page:
+                            page.keyboard.press("Escape")
+                    except Exception:
+                        pass
+                    frame.wait_for_timeout(200)
                 else:
                     logs.append(
                         f"[submit_guard] No safe default for required field '{ef['label']}' "
                         f"(id={ef['id']}) — leaving blank"
                     )
 
-        # FIX: Ensure no dropdown is open before clicking Submit
+        # Close any open dropdown before clicking Submit
         _close_open_dropdowns(frame, page, logs)
 
         try:
@@ -510,6 +468,22 @@ def submit_with_retry(
                         break
                 if not matched_field:
                     continue
+
+                # location city — use typeahead path, not react-select
+                if matched_field.get("id") == "candidate-location":
+                    try:
+                        city = candidate_profile.get("location", "Hyderabad, India").split(",")[0].strip()
+                        refill_fn(
+                            frame,
+                            {"id": "candidate-location", "type": "text", "name": ""},
+                            city,
+                            logs,
+                            page,
+                        )
+                    except Exception as exc:
+                        logs.append(f"[submit_guard] Retry location refill error: {exc}")
+                    continue
+
                 opts = matched_field.get("options")
                 opt_labels = None
                 if opts and isinstance(opts[0], dict):
@@ -535,12 +509,17 @@ def submit_with_retry(
                     logs.append(
                         f"[submit_guard] Retry re-fill '{matched_field['label']}' -> '{default}'"
                     )
-                    # FIX: close stray dropdown before retry refill too
                     _close_open_dropdowns(frame, page, logs)
                     try:
                         refill_fn(frame, matched_field, default, logs, page)
                     except Exception as exc:
                         logs.append(f"[submit_guard] Retry refill error: {exc}")
+                    try:
+                        if page:
+                            page.keyboard.press("Escape")
+                    except Exception:
+                        pass
+                    frame.wait_for_timeout(200)
             frame.wait_for_timeout(800)
             continue
 

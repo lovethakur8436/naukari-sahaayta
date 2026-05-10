@@ -75,6 +75,7 @@ def _get_react_select_options(frame, field_id: str, page: Page = None) -> list[s
         except Exception:
             pass
 
+    # Always close the dropdown after scraping
     try:
         kb = page.keyboard if page is not None else None
         if kb:
@@ -137,6 +138,23 @@ def _fill_react_select(
     if not answer_text or not answer_text.strip():
         logs.append(f"react-select: skipping '{field_id}' — empty answer, leaving blank")
         return False
+
+    # FIX BUG 1: Close any stray open listbox BEFORE opening this field.
+    # Without this, control_div.click() re-opens the already-focused
+    # PREVIOUS dropdown instead of the current field's dropdown.
+    try:
+        open_listbox = frame.locator("div[role='listbox']:visible")
+        if open_listbox.count() > 0:
+            try:
+                if page:
+                    page.keyboard.press("Escape")
+                else:
+                    frame.locator("body").click(position={"x": 5, "y": 5}, timeout=800)
+            except Exception:
+                pass
+            frame.wait_for_timeout(200)
+    except Exception:
+        pass
 
     control_div = frame.locator(
         f"xpath=//input[@id='{field_id}']/ancestor::div[contains(@class,'select__control')]"
@@ -230,9 +248,9 @@ def _fill_react_select(
         options.nth(matched_idx).click(timeout=3000)
         frame.wait_for_timeout(400)
         logs.append(f"react-select: clicked '{option_texts[matched_idx]}' for {field_id}")
-        # FIX: Always press Escape after clicking to close the listbox
-        # This prevents the dropdown from remaining open and swallowing the
-        # next field's fill (the focus-leak / "Australia" bug).
+        # FIX BUG 1: Always press Escape after clicking to fully close the
+        # listbox and release focus. This prevents the dropdown from staying
+        # open and swallowing the next field's fill.
         try:
             kb = page.keyboard if page is not None else None
             if kb:
@@ -448,6 +466,10 @@ _SCRAPE_QUESTIONS_JS = (
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Checkbox fill helper
+# FIX BUG 3: Accept comma-separated values for multi-select checkbox groups.
+# The LLM is now instructed to return comma-separated labels for groups like
+# "countries you anticipate working in". This helper splits on comma and
+# checks each matching checkbox independently.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fill_checkbox_group(
@@ -501,22 +523,24 @@ def _fill_checkbox_group(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# candidate-location (Google Places typeahead) — dedicated fill helper
-# FIX: The plain blur() approach was leaving the field invalid. We now try
-# to pick the first dropdown suggestion. If none appears, we accept the typed
-# value by pressing Tab (which commits it in most Places implementations).
+# candidate-location (Google Places / freeform typeahead)
+# FIX BUG 2: Increased wait time and added a longer polling loop for the
+# autocomplete dropdown. Greenhouse's location field fires an async request
+# that can take 1.5–3 s before suggestions appear. The old 1200 ms wait was
+# not enough, causing the field to commit without a suggestion and fail
+# Greenhouse's validation ("Please enter your location").
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fill_location_typeahead(
     frame, field_id: str, city: str, logs: list, page: Page = None
 ) -> None:
     """
-    Fill a Google Places / freeform city typeahead field.
+    Fill a Google Places / freeform city typeahead.
     Strategy:
-      1. Type the city name character-by-character.
-      2. Wait up to 2 s for an autocomplete suggestion to appear.
-      3. If a suggestion is visible, click the first one.
-      4. If no suggestion, press Tab to commit the typed value.
+      1. Clear the field and type the city slowly (triggers autocomplete).
+      2. Poll for suggestions for up to 4 s (250 ms intervals).
+      3. Click the first suggestion if found.
+      4. If no suggestion after 4 s, accept the typed value with Enter then Tab.
     """
     try:
         el = frame.locator(f"input{_safe_css_id(field_id)}")
@@ -525,45 +549,63 @@ def _fill_location_typeahead(
             return
 
         el.click(timeout=3000)
-        el.fill("", timeout=2000)   # clear first
-        frame.wait_for_timeout(200)
-        el.type(city, delay=60)    # type slowly so autocomplete fires
-        frame.wait_for_timeout(1200)
+        el.fill("", timeout=2000)
+        frame.wait_for_timeout(300)
+        el.type(city, delay=80)   # type slowly so autocomplete fires
+        frame.wait_for_timeout(600)
 
-        # Try to find a suggestion dropdown
+        # Greenhouse uses a custom dropdown (not .pac-item). Poll broadly.
         suggestion_sel = (
-            f"div[role='option']:visible, "
+            "div[role='option']:visible, "
+            "li[role='option']:visible, "
             f"[id^='react-select-{field_id}-option']:visible, "
-            "ul.pac-container li:visible, "
-            ".pac-item:visible"
+            "[class*='autocomplete-suggestion']:visible, "
+            "[class*='suggestion']:visible, "
+            ".pac-item:visible, "
+            "ul.pac-container li:visible"
         )
-        suggestion = frame.locator(suggestion_sel).first
-        try:
-            suggestion.wait_for(state="visible", timeout=2000)
-            suggestion.click(timeout=2000)
-            logs.append(
-                f"Location typeahead '{field_id}': clicked suggestion '{suggestion.inner_text().strip()}'"
-            )
-            return
-        except Exception:
-            pass
 
-        # No suggestion — commit with Tab
-        try:
-            if page:
-                page.keyboard.press("Tab")
-            else:
-                el.press("Tab")
-            frame.wait_for_timeout(300)
-            logs.append(
-                f"Location typeahead '{field_id}': no suggestion found — committed '{city}' via Tab"
-            )
-        except Exception as tab_err:
-            logs.append(f"Location typeahead Tab commit failed: {tab_err}")
+        # Poll for up to 4 s (16 × 250 ms)
+        suggestion_clicked = False
+        for _ in range(16):
+            frame.wait_for_timeout(250)
             try:
-                el.evaluate("el => el.dispatchEvent(new Event('blur', { bubbles: true }))")
+                suggestion = frame.locator(suggestion_sel).first
+                if suggestion.count() > 0 and suggestion.is_visible():
+                    txt = suggestion.inner_text().strip()
+                    suggestion.click(timeout=2000)
+                    frame.wait_for_timeout(400)
+                    logs.append(
+                        f"Location typeahead '{field_id}': clicked suggestion '{txt}'"
+                    )
+                    suggestion_clicked = True
+                    break
             except Exception:
                 pass
+
+        if not suggestion_clicked:
+            # Accept whatever was typed — Enter commits in most implementations,
+            # Tab moves focus and fires blur/change events.
+            try:
+                if page:
+                    page.keyboard.press("Enter")
+                    frame.wait_for_timeout(200)
+                    page.keyboard.press("Tab")
+                else:
+                    el.press("Enter")
+                    frame.wait_for_timeout(200)
+                    el.press("Tab")
+                frame.wait_for_timeout(300)
+                logs.append(
+                    f"Location typeahead '{field_id}': no suggestion after 4s — "
+                    f"committed '{city}' via Enter+Tab"
+                )
+            except Exception as tab_err:
+                logs.append(f"Location typeahead Tab commit failed: {tab_err}")
+                try:
+                    el.evaluate("el => el.dispatchEvent(new Event('blur', { bubbles: true }))")
+                except Exception:
+                    pass
     except Exception as e:
         logs.append(f"Location typeahead fill error for '{field_id}': {e}")
 
@@ -592,8 +634,9 @@ def _refill_field(frame, field_info: dict, answer: str, logs: list, page: Page):
         _fill_checkbox_group(frame, field_info, answer, logs)
 
     else:
-        # FIX: candidate-location is a Google Places typeahead —
-        # use dedicated helper instead of plain fill()+blur()
+        # FIX BUG 2: candidate-location must use the typeahead helper.
+        # Do NOT fall through to plain fill() — that leaves the field
+        # unvalidated and Greenhouse rejects it with "Please enter your location".
         if fid == "candidate-location":
             _fill_location_typeahead(frame, fid, answer, logs, page=page)
             return
@@ -713,15 +756,15 @@ class GreenhouseApplyAgent(BaseApplyAgent):
             if not questions_data:
                 questions_data = []
 
-            # FIX: Use dedicated typeahead helper for candidate-location
-            # (Google Places input — plain blur() was leaving it invalid)
+            # Fill candidate-location using dedicated typeahead helper
             LOCATION_FIELDS: dict[str, str] = {
                 "candidate-location": candidate_profile.get("location", "Hyderabad, India"),
             }
             for field_id, fill_value in LOCATION_FIELDS.items():
                 el = frame.locator(f"input{_safe_css_id(field_id)}")
                 if el.count() > 0:
-                    _fill_location_typeahead(frame, field_id, fill_value, result["logs"], page=page)
+                    city_only = fill_value.split(",")[0].strip()
+                    _fill_location_typeahead(frame, field_id, city_only, result["logs"], page=page)
                     questions_data = [q for q in questions_data if q.get("id") != field_id]
 
             TYPEAHEAD_FIELD_HINTS: dict[str, str] = {}
@@ -812,11 +855,13 @@ INSTRUCTIONS:
     or return null — do NOT return an empty string "". Returning "" will silently pick
     the first available option, which is almost always wrong.
 18. CHECKBOX GROUPS (type=checkbox): The `options` array lists all available checkboxes with
-    their `label` and `id`. Return the LABEL string of the option(s) to check, NOT the DOM id.
-    For multi-select groups (e.g. "countries you anticipate working in"), return a
-    comma-separated string of LABELS matching the candidate's situation.
-    Example: for "countries you anticipate working in" -> return "India".
-    Example: for "areas of specialization" -> return "Backend,Full-Stack".
+    their `label` and `id`. Return the LABEL string(s) of the option(s) to check, NOT the DOM id.
+    For MULTI-SELECT checkbox groups (e.g. "countries you anticipate working in"),
+    return a COMMA-SEPARATED string of matching LABELS.
+    - "countries you anticipate working in" or "anticipate working" -> return "India"
+    - "areas of specialization" -> return "Backend,Full-Stack"
+    - Single-select checkbox groups -> return only one label.
+    NEVER return a DOM id as the answer for a checkbox group.
 
 CRITICAL RULE FOR react-select FIELDS:
 - The `options` list contains the EXACT visible text of every choice available in that dropdown.
