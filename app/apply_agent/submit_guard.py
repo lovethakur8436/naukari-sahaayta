@@ -21,8 +21,12 @@ if TYPE_CHECKING:
 # ─────────────────────────────────────────────────────────────────────────────
 
 SAFE_DEFAULTS: list[tuple[str, str | list]] = [
-    (r"years.{0,20}experience|experience.{0,20}years",  "3-4 years"),
-    (r"how many years",                                  "3-4 years"),
+    # FIX: Map to EXACT option text that Stripe/Greenhouse scraped:
+    # '5 - 10 years of experience as a software engineer'
+    # Candidate has ~5 years (Nov 2018 - May 2026)
+    (r"years.{0,20}experience|experience.{0,20}years|how many years",
+     ["5 - 10 years of experience as a software engineer",
+      "5-10 years", "5+ years", "5 - 10 years", "3-4 years"]),
     (r"level of experience|seniority",                   "Mid-level"),
     (r"specializ|area.{0,15}work|domain",               ["Backend", "Full-Stack"]),
     (r"which.{0,20}area",                               ["Backend"]),
@@ -42,15 +46,16 @@ SAFE_DEFAULTS: list[tuple[str, str | list]] = [
      "__REMOTE_PICK__"),
     (r"how.{0,20}hear|referr|source",                    "LinkedIn"),
     (r"preferred.{0,15}contact|best.{0,10}way",          "Email"),
+    # FIX: Use real employer name, not N/A
     (r"current.{0,15}(company|employer)|previous.{0,15}(company|employer)|who is your current",
-     "N/A"),
+     "Wells Fargo"),
     (r"job.?title|current.{0,15}title|previous.{0,15}title",
      "Software Engineer"),
     (r"(previously|ever|before).{0,30}(employ|work).{0,30}(stripe|company|us|affiliate)"
      r"|(employ|work).{0,30}(stripe|company|us|affiliate).{0,30}(previously|before|ever)",
      ["No", "No, I have not"]),
     (r"school|universit|college|institution|attended",
-     "Maharshi Dayanand University"),
+     "Lovely Professional University"),
     (r"degree|qualification|highest.{0,15}education",
      ["Bachelor", "Bachelor's", "B.Tech", "Bachelor of Technology",
       "Bachelors", "B.E.", "B.Sc", "Undergraduate"]),
@@ -76,6 +81,7 @@ SAFE_DEFAULTS: list[tuple[str, str | list]] = [
      ["Yes", "I consent", "Yes, I consent"]),
     (r"non.?compete|employment.?agreement|reasonable.{0,20}accommodation",
      ["No", "No, I do not"]),
+    # FIX: 'If located in the US' is a plain text field — candidate answers N/A
     (r"(city|state).{0,15}(reside|located).{0,15}us"
      r"|if located in the us",
      "N/A"),
@@ -209,8 +215,6 @@ _SCAN_REQUIRED_JS = (
 def _scan_required_empty(frame, logs: list) -> list[dict]:
     try:
         results = frame.evaluate(_SCAN_REQUIRED_JS)
-        # Deduplicate by field ID — Greenhouse sometimes registers the same
-        # combobox input both as text and as react-select if the DOM is mid-render.
         seen: set[str] = set()
         deduped: list[dict] = []
         for ef in (results or []):
@@ -227,16 +231,6 @@ def _scan_required_empty(frame, logs: list) -> list[dict]:
         return []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FIX: Fully close any open react-select dropdown before touching the next
-# field. The strategy:
-#   1. Press Escape (keyboard event — closes most react-select dropdowns)
-#   2. Click a neutral spot on the body (blurs focus away from the select)
-#   3. Wait for any visible listbox to disappear (up to 600ms)
-# Without this, the country field's open listbox intercepts clicks/types
-# meant for subsequent fields (auth, sponsor, remote, etc.).
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _close_open_dropdowns(frame, page, logs: list) -> None:
     """Press Escape + blur to close any stray open react-select listbox, then wait."""
     try:
@@ -245,12 +239,10 @@ def _close_open_dropdowns(frame, page, logs: list) -> None:
                 page.keyboard.press("Escape")
         except Exception:
             pass
-
         try:
             frame.locator("body").click(position={"x": 5, "y": 5}, timeout=500, force=True)
         except Exception:
             pass
-
         try:
             frame.wait_for_selector(
                 "div[role='listbox']:visible",
@@ -259,15 +251,10 @@ def _close_open_dropdowns(frame, page, logs: list) -> None:
             )
         except Exception:
             pass
-
         frame.wait_for_timeout(150)
     except Exception:
         pass
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FIX: Verify a react-select field actually holds a value after filling.
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _get_react_select_current_value(frame, field_id: str) -> str:
     js = f"""
@@ -286,27 +273,6 @@ def _get_react_select_current_value(frame, field_id: str) -> str:
         return ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FIX: Isolated react-select fill — targets THIS field's container only.
-#
-# Root cause of the "Australia" bug:
-#   Greenhouse re-renders sibling react-selects after each country selection.
-#   On re-render, all combobox inputs share a single listbox div whose
-#   aria-controls attribute still points at the COUNTRY field's listbox ID.
-#   So when submit_guard tried to fill question_60419388 (auth) it opened
-#   the correct combobox but then searched for options in the country listbox,
-#   finding nothing, then fell through to a global div[role='listbox'] query
-#   which found the country dropdown (already open from a prior iteration).
-#
-# Fix:
-#   1. Always target the listbox via the specific input's aria-controls.
-#   2. If aria-controls listbox is missing/wrong, check that the listbox
-#      is a DOM descendant of the same .select__container as our input.
-#      If not — close all dropdowns, re-click our control, and retry.
-#   3. Add a 700ms post-fill settle wait (Greenhouse DOM re-render window)
-#      before the caller can trigger the next fill.
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _fill_react_select_isolated(
     frame,
     page,
@@ -314,10 +280,6 @@ def _fill_react_select_isolated(
     value: str,
     logs: list,
 ) -> bool:
-    """
-    Fill a react-select for a specific field_id.
-    Returns True on success.
-    """
     _close_open_dropdowns(frame, page, logs)
 
     def _attempt_fill() -> bool:
@@ -338,8 +300,6 @@ def _fill_react_select_isolated(
                 logs.append(f"[guard-isolated] no .select__control for #{field_id}")
                 return False
 
-            # Click THIS field's control specifically via JS to avoid
-            # accidentally activating whichever element has keyboard focus.
             frame.evaluate(f"""
             () => {{
                 var inp = document.getElementById('{field_id}');
@@ -355,37 +315,25 @@ def _fill_react_select_isolated(
             inp_locator.type(value[:12], delay=40)
             frame.wait_for_timeout(450)
 
-            # Get options: first try field's own aria-controls listbox,
-            # then fall back to listbox scoped inside our select container.
-            # NEVER use a global div[role='listbox'] query — that can match
-            # the country dropdown's still-open listbox from a prior fill.
             opts_js = f"""
             () => {{
                 var inp = document.getElementById('{field_id}');
                 if (!inp) return [];
-
-                // Preferred: field-specific listbox via aria-controls
                 var listbox_id = inp.getAttribute('aria-controls');
                 var listbox = listbox_id ? document.getElementById(listbox_id) : null;
-
-                // Verify the listbox actually belongs to THIS field's container
                 if (listbox) {{
                     var container = inp.closest('.select__container, .select__control');
                     if (container && !container.contains(listbox) && !document.getElementById(listbox_id)) {{
-                        listbox = null;  // stale ID pointing at another field's listbox
+                        listbox = null;
                     }}
                 }}
-
-                // Fallback: find listbox scoped inside our .select__container
                 if (!listbox) {{
                     var parentContainer = inp.closest('[class*="select"]');
                     if (parentContainer) {{
                         listbox = parentContainer.querySelector("div[role='listbox']");
                     }}
                 }}
-
                 if (!listbox) return [];
-
                 var opts = Array.from(listbox.querySelectorAll("div[role='option']")).map(o => o.innerText.trim());
                 return opts.filter(o => o.length > 0);
             }}
@@ -424,20 +372,16 @@ def _fill_react_select_isolated(
                 _close_open_dropdowns(frame, page, logs)
                 return False
 
-            # Click the matched option via field-scoped listbox only.
             click_js = f"""
             (matchedText) => {{
                 var inp = document.getElementById('{field_id}');
                 if (!inp) return false;
-
                 var listbox_id = inp.getAttribute('aria-controls');
                 var listbox = listbox_id ? document.getElementById(listbox_id) : null;
-
                 if (!listbox) {{
                     var parentContainer = inp.closest('[class*="select"]');
                     if (parentContainer) listbox = parentContainer.querySelector("div[role='listbox']");
                 }}
-
                 if (!listbox) return false;
                 var opts = listbox.querySelectorAll("div[role='option']");
                 for (var o of opts) {{
@@ -451,7 +395,6 @@ def _fill_react_select_isolated(
             """
             clicked = frame.evaluate(click_js, matched)
 
-            # Settle: 700ms for Greenhouse to re-render sibling fields
             frame.wait_for_timeout(700)
             _close_open_dropdowns(frame, page, logs)
 
@@ -467,19 +410,16 @@ def _fill_react_select_isolated(
             _close_open_dropdowns(frame, page, logs)
             return False
 
-    # ── First attempt ──────────────────────────────────────────────────────
     ok = _attempt_fill()
     if not ok:
         return False
 
-    # ── Verify the value stuck (Greenhouse sometimes re-renders siblings) ──
     frame.wait_for_timeout(350)
     current = _get_react_select_current_value(frame, field_id)
     if current and value.lower() in current.lower():
         logs.append(f"[guard-isolated] verified #{field_id} = '{current}'")
         return True
 
-    # Value was cleared by a sibling re-render — retry once
     logs.append(
         f"[guard-isolated] #{field_id} value cleared after fill (got '{current}') — retrying once"
     )
@@ -577,13 +517,6 @@ def _guard_fill_field(
     logs: list,
     refill_fn,
 ) -> None:
-    """
-    Fill a single empty required field during the submit-guard pass.
-
-    Uses _fill_react_select_isolated() for react-select fields to ensure
-    each field's own container and listbox is targeted — never the globally
-    focused element or a stale listbox from a previously filled field.
-    """
     ftype = ef.get("type")
     field_id = ef.get("id", "")
 
@@ -598,6 +531,15 @@ def _guard_fill_field(
                 refill_fn(frame, field_info, default, logs, page)
             except Exception as exc:
                 logs.append(f"[guard] refill_fn fallback error for #{field_id}: {exc}")
+    elif ftype == "text" and field_id:
+        # FIX: plain text fields must be filled directly — not via react-select path
+        try:
+            el = frame.locator(f"[id='{field_id}']")
+            el.fill(str(default), timeout=5000)
+            el.evaluate("el => el.dispatchEvent(new Event('blur', { bubbles: true }))")
+            logs.append(f"[guard] text fill '{field_id}' = '{default}'")
+        except Exception as exc:
+            logs.append(f"[guard] text fill error for '{field_id}': {exc}")
     else:
         try:
             refill_fn(frame, field_info, default, logs, page)
@@ -633,7 +575,6 @@ def submit_with_retry(
             for ef in empty_fields:
                 ftype = ef.get("type")
 
-                # ── Resume re-upload ────────────────────────────────────
                 if ftype == "file" and resume_path:
                     try:
                         frame.locator("input[type='file']").first.set_input_files(resume_path)
@@ -642,7 +583,6 @@ def submit_with_retry(
                         logs.append(f"[submit_guard] Resume re-upload failed: {exc}")
                     continue
 
-                # ── location-typeahead ──────────────────────────────────
                 if ftype == "location-typeahead" or ef.get("id") == "candidate-location":
                     try:
                         city = candidate_profile.get("location", "Hyderabad, India").split(",")[0].strip()
@@ -671,7 +611,21 @@ def submit_with_retry(
                     else:
                         opt_labels = list(opts)
 
+                # For years-of-experience, scrape live options so we can exact-match
                 label_lower = (ef.get("label") or "").lower()
+                is_years_exp = bool(re.search(r"years.{0,20}experience|how many years", label_lower))
+                if is_years_exp and ef.get("type") == "react-select" and not opt_labels:
+                    try:
+                        from app.apply_agent.greenhouse import _get_react_select_options
+                        live_opts = _get_react_select_options(frame, ef["id"], page=page)
+                        if live_opts:
+                            opt_labels = live_opts
+                            logs.append(
+                                f"[submit_guard] Scraped years-exp options for '{ef['id']}': {live_opts}"
+                            )
+                    except Exception as scrape_err:
+                        logs.append(f"[submit_guard] Live option scrape failed: {scrape_err}")
+
                 is_remote_field = bool(re.search(
                     r"remote|work.{0,10}(from|preference|location)|plan.{0,10}work.{0,10}remote",
                     label_lower
@@ -701,7 +655,6 @@ def submit_with_retry(
                         f"(id={ef['id']}) — leaving blank"
                     )
 
-        # Close any open dropdown before clicking Submit
         _close_open_dropdowns(frame, page, logs)
 
         try:

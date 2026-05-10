@@ -75,7 +75,6 @@ def _get_react_select_options(frame, field_id: str, page: Page = None) -> list[s
         except Exception:
             pass
 
-    # Always close the dropdown after scraping
     try:
         kb = page.keyboard if page is not None else None
         if kb:
@@ -139,9 +138,6 @@ def _fill_react_select(
         logs.append(f"react-select: skipping '{field_id}' — empty answer, leaving blank")
         return False
 
-    # FIX BUG 1: Close any stray open listbox BEFORE opening this field.
-    # Without this, control_div.click() re-opens the already-focused
-    # PREVIOUS dropdown instead of the current field's dropdown.
     try:
         open_listbox = frame.locator("div[role='listbox']:visible")
         if open_listbox.count() > 0:
@@ -248,9 +244,6 @@ def _fill_react_select(
         options.nth(matched_idx).click(timeout=3000)
         frame.wait_for_timeout(400)
         logs.append(f"react-select: clicked '{option_texts[matched_idx]}' for {field_id}")
-        # FIX BUG 1: Always press Escape after clicking to fully close the
-        # listbox and release focus. This prevents the dropdown from staying
-        # open and swallowing the next field's fill.
         try:
             kb = page.keyboard if page is not None else None
             if kb:
@@ -466,10 +459,6 @@ _SCRAPE_QUESTIONS_JS = (
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Checkbox fill helper
-# FIX BUG 3: Accept comma-separated values for multi-select checkbox groups.
-# The LLM is now instructed to return comma-separated labels for groups like
-# "countries you anticipate working in". This helper splits on comma and
-# checks each matching checkbox independently.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fill_checkbox_group(
@@ -524,24 +513,11 @@ def _fill_checkbox_group(
 
 # ─────────────────────────────────────────────────────────────────────────────
 # candidate-location (Google Places / freeform typeahead)
-# FIX BUG 2: Increased wait time and added a longer polling loop for the
-# autocomplete dropdown. Greenhouse's location field fires an async request
-# that can take 1.5–3 s before suggestions appear. The old 1200 ms wait was
-# not enough, causing the field to commit without a suggestion and fail
-# Greenhouse's validation ("Please enter your location").
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fill_location_typeahead(
     frame, field_id: str, city: str, logs: list, page: Page = None
 ) -> None:
-    """
-    Fill a Google Places / freeform city typeahead.
-    Strategy:
-      1. Clear the field and type the city slowly (triggers autocomplete).
-      2. Poll for suggestions for up to 4 s (250 ms intervals).
-      3. Click the first suggestion if found.
-      4. If no suggestion after 4 s, accept the typed value with Enter then Tab.
-    """
     try:
         el = frame.locator(f"input{_safe_css_id(field_id)}")
         if el.count() == 0:
@@ -551,10 +527,9 @@ def _fill_location_typeahead(
         el.click(timeout=3000)
         el.fill("", timeout=2000)
         frame.wait_for_timeout(300)
-        el.type(city, delay=80)   # type slowly so autocomplete fires
+        el.type(city, delay=80)
         frame.wait_for_timeout(600)
 
-        # Greenhouse uses a custom dropdown (not .pac-item). Poll broadly.
         suggestion_sel = (
             "div[role='option']:visible, "
             "li[role='option']:visible, "
@@ -565,7 +540,6 @@ def _fill_location_typeahead(
             "ul.pac-container li:visible"
         )
 
-        # Poll for up to 4 s (16 × 250 ms)
         suggestion_clicked = False
         for _ in range(16):
             frame.wait_for_timeout(250)
@@ -584,8 +558,6 @@ def _fill_location_typeahead(
                 pass
 
         if not suggestion_clicked:
-            # Accept whatever was typed — Enter commits in most implementations,
-            # Tab moves focus and fires blur/change events.
             try:
                 if page:
                     page.keyboard.press("Enter")
@@ -634,9 +606,6 @@ def _refill_field(frame, field_info: dict, answer: str, logs: list, page: Page):
         _fill_checkbox_group(frame, field_info, answer, logs)
 
     else:
-        # FIX BUG 2: candidate-location must use the typeahead helper.
-        # Do NOT fall through to plain fill() — that leaves the field
-        # unvalidated and Greenhouse rejects it with "Please enter your location".
         if fid == "candidate-location":
             _fill_location_typeahead(frame, fid, answer, logs, page=page)
             return
@@ -756,7 +725,6 @@ class GreenhouseApplyAgent(BaseApplyAgent):
             if not questions_data:
                 questions_data = []
 
-            # Fill candidate-location using dedicated typeahead helper
             LOCATION_FIELDS: dict[str, str] = {
                 "candidate-location": candidate_profile.get("location", "Hyderabad, India"),
             }
@@ -849,12 +817,15 @@ INSTRUCTIONS:
 12. Work authorization -> "Yes" (candidate is authorized to work in India).
 13. Previously employed at this company -> "No".
 14. Current/previous job title -> "Software Engineer".
-15. School attended -> "Maharshi Dayanand University".
+15. School attended -> "Lovely Professional University".
 16. Degree obtained -> match nearest available option to "Bachelor of Technology" or "B.Tech".
-17. OPTIONAL FIELDS: If a field is optional and you have no clear answer, omit the key entirely
+17. Current or previous employer -> "Wells Fargo" (NOT 'N/A').
+18. If located in the US, city and state -> "N/A" (candidate is in India, not the US).
+19. Years of experience -> pick the option from `options` that best fits 5 years (e.g. '5 - 10 years of experience as a software engineer').
+20. OPTIONAL FIELDS: If a field is optional and you have no clear answer, omit the key entirely
     or return null — do NOT return an empty string "". Returning "" will silently pick
     the first available option, which is almost always wrong.
-18. CHECKBOX GROUPS (type=checkbox): The `options` array lists all available checkboxes with
+21. CHECKBOX GROUPS (type=checkbox): The `options` array lists all available checkboxes with
     their `label` and `id`. Return the LABEL string(s) of the option(s) to check, NOT the DOM id.
     For MULTI-SELECT checkbox groups (e.g. "countries you anticipate working in"),
     return a COMMA-SEPARATED string of matching LABELS.
@@ -1022,7 +993,6 @@ Return a flat JSON object: keys = field `id` (use the top-level `id` for the gro
         except Exception:
             pass
 
-        # ── Submit with retry (Layers 2 + 3) ──────────────────────────────
         pre_submit_url = page.url
         outcome = submit_with_retry(
             page=page,
