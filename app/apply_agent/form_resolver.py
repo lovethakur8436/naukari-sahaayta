@@ -14,7 +14,7 @@ Resolution strategy (tried in order):
   1. Strict Greenhouse form present? (input#first_name)              -> done.
   2. Scroll to bottom -> recheck strict.                             -> Figma pattern.
   3. Click Apply button -> wait for SPA render
-     -> recheck strict OR broad OR iframe.                           -> Stripe pattern.
+     -> recheck strict OR broad OR iframe (with deep iframe wait).   -> Stripe pattern.
   4. /apply URL heuristic (only if NOT already on /apply URL)
      -> wait for SPA render -> recheck strict OR broad OR iframe.    -> Stripe fallback.
   5. Give up -> SKIPPED.
@@ -22,7 +22,8 @@ Resolution strategy (tried in order):
 Broad form detection (steps 3 & 4):
   - Checks for any visible <input type=text/email> or <textarea> inside <form>/[role=main].
   - Also detects iframe-embedded forms (Stripe/Workday) by presence of <iframe> on /apply URLs.
-  - Only runs when on an /apply or /application URL to avoid false-positives.
+  - For confirmed iframe patterns, performs a deeper poll (up to 12s) to wait for Workday
+    widget hydration before returning True, so the caller can switch into the iframe context.
 """
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
@@ -55,8 +56,10 @@ _APPLY_BUTTON_SELECTORS = [
     "[class*='ApplyButton']:visible",
 ]
 
-# Extra wait after navigation to let React SPAs / Workday iframes hydrate
+# Extra wait after navigation to let React SPAs hydrate
 _SPA_RENDER_WAIT_MS = 3_000
+# Extra deep-wait for Workday / iframe widgets to fully render
+_IFRAME_DEEP_WAIT_MS = 12_000
 
 
 # ------------------------------------------------------------------ #
@@ -64,7 +67,7 @@ _SPA_RENDER_WAIT_MS = 3_000
 # ------------------------------------------------------------------ #
 
 def _check_strict(page: Page, timeout_ms: int = 6_000) -> bool:
-    """Standard Greenhouse form — input#first_name present."""
+    """Standard Greenhouse form — input#first_name present in top-level DOM."""
     try:
         page.wait_for_selector(_STRICT_FORM_SELECTOR, timeout=timeout_ms)
         return True
@@ -72,28 +75,71 @@ def _check_strict(page: Page, timeout_ms: int = 6_000) -> bool:
         return False
 
 
-def _check_broad(page: Page, logs: list) -> bool:
+def _check_strict_in_any_frame(page: Page, logs: list, timeout_ms: int = 6_000) -> bool:
+    """
+    Search for input#first_name inside every iframe on the page.
+    Used for Stripe/Workday embed pattern where the form lives inside an iframe.
+    Returns True and appends the confirmed frame URL to logs.
+    """
+    try:
+        frames = page.frames
+        for frame in frames[1:]:  # skip main frame
+            try:
+                frame.wait_for_selector(_STRICT_FORM_SELECTOR, timeout=timeout_ms)
+                logs.append(
+                    f"_check_strict_in_any_frame: found input#first_name inside iframe '{frame.url}'"
+                )
+                return True
+            except PlaywrightTimeoutError:
+                continue
+            except Exception:
+                continue
+    except Exception as e:
+        logs.append(f"_check_strict_in_any_frame: error — {e}")
+    return False
+
+
+def _wait_for_iframe_input(page: Page, logs: list) -> bool:
+    """
+    Poll every iframe on the page every 1.5s for up to _IFRAME_DEEP_WAIT_MS
+    looking for input#first_name.  This gives Workday / embedded widgets
+    enough time to fully hydrate before we give up.
+    """
+    import time
+    deadline = time.monotonic() + (_IFRAME_DEEP_WAIT_MS / 1000)
+    poll_interval = 1.5
+    attempt = 0
+    while time.monotonic() < deadline:
+        attempt += 1
+        if _check_strict_in_any_frame(page, logs, timeout_ms=1_000):
+            logs.append(f"_wait_for_iframe_input: form found after {attempt} poll(s)")
+            return True
+        page.wait_for_timeout(int(poll_interval * 1000))
+    logs.append(f"_wait_for_iframe_input: iframe form NOT found after {_IFRAME_DEEP_WAIT_MS}ms")
+    return False
+
+
+def _check_broad(page: Page, logs: list) -> tuple[bool, bool]:
     """
     Broader form detection for React SPA / iframe portals.
     Only runs when on an /apply or /application URL to avoid false-positives.
 
-    Three layers:
-      1. Visible form inputs in the top-level DOM (React SPA forms)
-      2. <iframe> presence on the page (Stripe embeds Workday in an iframe;
-         the iframe itself is the form even though input#first_name is absent
-         from the parent frame).
+    Returns:
+        (form_present: bool, is_iframe_embed: bool)
+        is_iframe_embed=True signals the caller that filling must happen
+        inside a child frame, not the top-level page.
     """
     url_lower = page.url.lower()
     if "/apply" not in url_lower and "/application" not in url_lower:
         logs.append("_check_broad: skipped (not on an /apply URL)")
-        return False
+        return False, False
 
     # Layer 1: visible inputs in top-level DOM
     for sel in _BROAD_FORM_SELECTORS:
         try:
             if page.locator(sel).first.count() > 0:
                 logs.append(f"_check_broad: form detected via top-level selector '{sel}'")
-                return True
+                return True, False
         except Exception:
             continue
 
@@ -103,14 +149,21 @@ def _check_broad(page: Page, logs: list) -> bool:
         if iframe_count > 0:
             logs.append(
                 f"_check_broad: found {iframe_count} iframe(s) on /apply page — "
-                "treating as embedded form (Stripe/Workday pattern)"
+                "starting deep iframe wait for Workday/embedded form"
             )
-            return True
+            # Deep-poll: wait until the iframe actually renders input#first_name
+            hydrated = _wait_for_iframe_input(page, logs)
+            if hydrated:
+                logs.append("_check_broad: iframe form hydrated and ready")
+                return True, True  # is_iframe_embed = True
+            else:
+                logs.append("_check_broad: iframe(s) found but form never hydrated — treating as no form")
+                return False, False
     except Exception:
         pass
 
-    logs.append("_check_broad: no form inputs or iframes found")
-    return False
+    logs.append("_check_broad: no form inputs found")
+    return False, False
 
 
 def _scroll_and_check_strict(page: Page) -> bool:
@@ -124,10 +177,13 @@ def _scroll_and_check_strict(page: Page) -> bool:
         return False
 
 
-def _wait_spa_then_check(page: Page, logs: list, app_id=None) -> bool:
+def _wait_spa_then_check(page: Page, logs: list, app_id=None) -> tuple[bool, bool]:
     """
     Wait for SPA/iframe hydration, take a debug screenshot, then try
     strict -> broad detection in order.
+
+    Returns:
+        (form_present: bool, is_iframe_embed: bool)
     """
     try:
         page.wait_for_load_state("networkidle", timeout=15_000)
@@ -145,11 +201,13 @@ def _wait_spa_then_check(page: Page, logs: list, app_id=None) -> bool:
 
     if _check_strict(page, timeout_ms=4_000):
         logs.append("_wait_spa_then_check: strict form found after SPA wait")
-        return True
-    if _check_broad(page, logs):
+        return True, False
+
+    found, is_iframe = _check_broad(page, logs)
+    if found:
         logs.append("_wait_spa_then_check: broad/iframe form confirmed after SPA wait")
-        return True
-    return False
+        return True, is_iframe
+    return False, False
 
 
 def _find_and_click_apply(page: Page, logs: list) -> bool:
@@ -188,11 +246,28 @@ def _try_append_apply(page: Page, logs: list) -> bool:
         return False
 
 
+def get_form_frame(page: Page, is_iframe_embed: bool):
+    """
+    Return the frame that contains the actual form.
+    For iframe-embedded portals (Stripe/Workday) this is the child frame
+    that contains input#first_name.  For all others it is the main page.
+    """
+    if not is_iframe_embed:
+        return page
+    for frame in page.frames[1:]:
+        try:
+            if frame.locator(_STRICT_FORM_SELECTOR).count() > 0:
+                return frame
+        except Exception:
+            continue
+    return page  # fallback: return main page
+
+
 # ------------------------------------------------------------------ #
 # Public API                                                           #
 # ------------------------------------------------------------------ #
 
-def resolve_apply_form(page: Page, logs: list, app_id=None) -> bool:
+def resolve_apply_form(page: Page, logs: list, app_id=None) -> tuple[bool, bool]:
     """
     Navigate to the actual apply form regardless of portal type.
 
@@ -202,40 +277,44 @@ def resolve_apply_form(page: Page, logs: list, app_id=None) -> bool:
         app_id: Optional application ID used for debug screenshot filenames.
 
     Returns:
-        True  — form is ready (strict Greenhouse, SPA inputs, or iframe embed detected).
-        False — no form found after all strategies (job closed / unsupported portal).
+        (found: bool, is_iframe_embed: bool)
+        found          — form is ready.
+        is_iframe_embed — True means the form lives inside a child iframe;
+                          caller must use get_form_frame() to get the right frame.
     """
     logs.append(f"resolve_apply_form: starting on {page.url}")
 
     # ── Step 1: Already on a standard Greenhouse form ─────────────────────
     if _check_strict(page):
         logs.append("resolve_apply_form: strict form already present.")
-        return True
+        return True, False
 
     # ── Step 2: Scroll to bottom (Figma — form embedded at page bottom) ───
     logs.append("resolve_apply_form: form not visible — scrolling to bottom...")
     if _scroll_and_check_strict(page):
         logs.append("resolve_apply_form: strict form found after scroll.")
-        return True
+        return True, False
 
     # ── Step 3: Click Apply button then wait for SPA/iframe render ─────────
     logs.append("resolve_apply_form: hunting for Apply button...")
     clicked = _find_and_click_apply(page, logs)
     if clicked:
         logs.append("resolve_apply_form: Apply button clicked — waiting for SPA/iframe render...")
-        if _wait_spa_then_check(page, logs, app_id=app_id):
+        found, is_iframe = _wait_spa_then_check(page, logs, app_id=app_id)
+        if found:
             logs.append("resolve_apply_form: form confirmed after Apply click.")
-            return True
+            return True, is_iframe
 
     # ── Step 4: /apply URL heuristic — only if NOT already on /apply ──────
     if "/apply" not in page.url.lower():
         logs.append("resolve_apply_form: trying /apply URL heuristic...")
         navigated = _try_append_apply(page, logs)
         if navigated:
-            if _wait_spa_then_check(page, logs, app_id=app_id):
+            found, is_iframe = _wait_spa_then_check(page, logs, app_id=app_id)
+            if found:
                 logs.append("resolve_apply_form: form confirmed via /apply URL.")
-                return True
+                return True, is_iframe
 
     # ── Step 5: Give up ───────────────────────────────────────────────────
     logs.append("resolve_apply_form: EXHAUSTED all strategies — no form found.")
-    return False
+    return False, False

@@ -1,6 +1,6 @@
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 from app.apply_agent.base import BaseApplyAgent
-from app.apply_agent.form_resolver import resolve_apply_form
+from app.apply_agent.form_resolver import resolve_apply_form, get_form_frame
 from app.models.application import Application
 import json
 import os
@@ -19,19 +19,19 @@ def _safe_css_id(field_id: str) -> str:
     return f"[id='{field_id}']"
 
 
-def _get_react_select_options(page, field_id: str) -> list[str]:
-    control_div = page.locator(
+def _get_react_select_options(frame, field_id: str) -> list[str]:
+    control_div = frame.locator(
         f"xpath=//input[@id='{field_id}']/ancestor::div[contains(@class,'select__control')]"
     )
     try:
         control_div.click(timeout=4000)
-        page.wait_for_timeout(400)
+        frame.wait_for_timeout(400)
     except Exception:
         return []
 
-    options = page.locator(f"[id^='react-select-{field_id}-option']")
+    options = frame.locator(f"[id^='react-select-{field_id}-option']")
     if options.count() == 0:
-        options = page.locator("div[role='option']:visible")
+        options = frame.locator("div[role='option']:visible")
 
     texts = []
     for i in range(options.count()):
@@ -40,29 +40,28 @@ def _get_react_select_options(page, field_id: str) -> list[str]:
         except Exception:
             pass
 
-    page.keyboard.press("Escape")
-    page.wait_for_timeout(200)
+    frame.keyboard.press("Escape")
+    frame.wait_for_timeout(200)
     return texts
 
 
-def _get_react_select_options_typeahead(page, field_id: str, search_term: str) -> list[str]:
-    # Use safe attribute selector for input to avoid [] crash
-    input_el = page.locator(f"input{_safe_css_id(field_id)}")
-    control_div = page.locator(
+def _get_react_select_options_typeahead(frame, field_id: str, search_term: str) -> list[str]:
+    input_el = frame.locator(f"input{_safe_css_id(field_id)}")
+    control_div = frame.locator(
         f"xpath=//input[@id='{field_id}']/ancestor::div[contains(@class,'select__control')]"
     )
     try:
         control_div.click(timeout=4000)
-        page.wait_for_timeout(300)
+        frame.wait_for_timeout(300)
         input_el.type(search_term[:10], delay=60)
-        page.wait_for_timeout(800)
+        frame.wait_for_timeout(800)
     except Exception:
-        page.keyboard.press("Escape")
+        frame.keyboard.press("Escape")
         return []
 
-    options = page.locator(f"[id^='react-select-{field_id}-option']")
+    options = frame.locator(f"[id^='react-select-{field_id}-option']")
     if options.count() == 0:
-        options = page.locator("div[role='option']:visible")
+        options = frame.locator("div[role='option']:visible")
 
     texts = []
     for i in range(options.count()):
@@ -71,54 +70,59 @@ def _get_react_select_options_typeahead(page, field_id: str, search_term: str) -
         except Exception:
             pass
 
-    page.keyboard.press("Escape")
-    page.wait_for_timeout(200)
+    frame.keyboard.press("Escape")
+    frame.wait_for_timeout(200)
     return texts
 
 
-def _fill_react_select(page, field_id: str, answer_text: str, logs: list) -> bool:
-    # Fix 2: skip filling entirely when LLM returned empty/null answer.
-    # Previously an empty string would match via startswith('') and silently
-    # pick the FIRST option (e.g. 'she/her/hers', '0-2 years', 'Yes').
+def _fill_react_select(frame, field_id: str, answer_text: str, logs: list) -> bool:
+    """
+    Fill a react-select dropdown.
+    - Uses safe attribute selectors to avoid CSS crash on IDs containing [].
+    - Skips entirely when answer_text is empty/null — avoids silently picking
+      the first option (e.g. 'she/her/hers', '0-2 years').
+    """
     if not answer_text or not answer_text.strip():
         logs.append(f"react-select: skipping '{field_id}' — LLM returned empty answer, leaving blank")
         return False
 
-    control_div = page.locator(
+    control_div = frame.locator(
         f"xpath=//input[@id='{field_id}']/ancestor::div[contains(@class,'select__control')]"
     )
-    # Fix 1: use safe attribute selector — avoids CSS crash on IDs like foo[]
-    input_el = page.locator(f"input{_safe_css_id(field_id)}")
+    # Always use attribute selector — never bare #id which crashes on foo[]
+    input_el = frame.locator(f"input{_safe_css_id(field_id)}")
 
     try:
         control_div.click(timeout=4000)
-        page.wait_for_timeout(300)
+        frame.wait_for_timeout(300)
     except Exception as e:
         logs.append(f"react-select open failed for {field_id}: {e}")
         return False
 
     first_word = answer_text.split()[0]
     try:
+        # Use attribute selector for type() too — avoids bracket-ID crash
         input_el.type(first_word, delay=50)
-        page.wait_for_timeout(500)
+        frame.wait_for_timeout(500)
     except Exception as e:
         logs.append(f"react-select type failed for {field_id}: {e}")
+        # Don't return — listbox may still be open with options
 
-    listbox = page.locator(f"[id='react-select-{field_id}-listbox'], div[role='listbox']").first
+    listbox = frame.locator(f"[id='react-select-{field_id}-listbox'], div[role='listbox']").first
     try:
         listbox.wait_for(state="visible", timeout=4000)
     except Exception:
         pass
 
-    options = page.locator(f"[id^='react-select-{field_id}-option']")
+    options = frame.locator(f"[id^='react-select-{field_id}-option']")
     count = options.count()
     if count == 0:
-        options = page.locator("div[role='option']:visible")
+        options = frame.locator("div[role='option']:visible")
         count = options.count()
 
     if count == 0:
         logs.append(f"react-select: no options after typing '{first_word}' for {field_id}")
-        page.keyboard.press("Escape")
+        frame.keyboard.press("Escape")
         return False
 
     option_texts = []
@@ -152,12 +156,12 @@ def _fill_react_select(page, field_id: str, answer_text: str, logs: list) -> boo
 
     if matched_idx is None:
         logs.append(f"react-select: NO MATCH for '{answer_text}' in {option_texts}")
-        page.keyboard.press("Escape")
+        frame.keyboard.press("Escape")
         return False
 
     try:
         options.nth(matched_idx).click(timeout=3000)
-        page.wait_for_timeout(400)
+        frame.wait_for_timeout(400)
         logs.append(f"react-select: clicked '{option_texts[matched_idx]}' for {field_id}")
         return True
     except Exception as e:
@@ -260,6 +264,78 @@ def _call_llm_with_fallback(prompt: str, logs: list) -> dict:
         raise RuntimeError(f"Gemini Flash also failed: {gemini_err}") from gemini_err
 
 
+# ────────────────────────────────────────────────────────────────────
+# Submit helpers
+# ────────────────────────────────────────────────────────────────────
+
+_CONFIRMATION_SELECTORS = [
+    "[class*='confirmation']:visible",
+    "[class*='success']:visible",
+    "[class*='thank']:visible",
+    "h1:has-text('Thank you'):visible",
+    "h2:has-text('Thank you'):visible",
+    "h1:has-text('Application submitted'):visible",
+    "p:has-text('Application received'):visible",
+    "p:has-text('successfully submitted'):visible",
+]
+
+_POST_SUBMIT_ERROR_SELECTORS = [
+    ".error-message:visible",
+    ".field_with_errors:visible",
+    "[class*='error']:visible",
+    "[class*='invalid']:visible",
+    "[aria-invalid='true']:visible",
+]
+
+
+def _wait_for_submit_outcome(page_or_frame, pre_submit_url: str, logs: list) -> str:
+    """
+    After clicking Submit, wait up to 8 s for one of:
+      - A confirmation element   -> return 'AUTO_APPLIED'
+      - URL change away from /apply -> return 'AUTO_APPLIED'
+      - A visible error element  -> return 'VALIDATION_FAILED'
+    If neither seen -> return 'FAILED'
+    """
+    import time
+    deadline = time.monotonic() + 8
+    poll_ms = 600
+
+    while time.monotonic() < deadline:
+        # Check URL change (works on page object, not frame)
+        try:
+            current_url = page_or_frame.url
+            if "/apply" in pre_submit_url.lower() and "/apply" not in current_url.lower():
+                logs.append(f"Submit confirmed: URL changed to '{current_url}'")
+                return "AUTO_APPLIED"
+        except Exception:
+            pass
+
+        # Check confirmation elements
+        for sel in _CONFIRMATION_SELECTORS:
+            try:
+                if page_or_frame.locator(sel).count() > 0:
+                    logs.append(f"Submit confirmed: found confirmation element '{sel}'")
+                    return "AUTO_APPLIED"
+            except Exception:
+                pass
+
+        # Check error elements
+        for sel in _POST_SUBMIT_ERROR_SELECTORS:
+            try:
+                els = page_or_frame.locator(sel).all_inner_texts()
+                blocking = [e.strip() for e in els if e.strip() and "required" in e.lower()]
+                if blocking:
+                    logs.append(f"Submit validation errors detected: {blocking}")
+                    return "VALIDATION_FAILED"
+            except Exception:
+                pass
+
+        page_or_frame.wait_for_timeout(poll_ms)
+
+    logs.append("Submit outcome: no confirmation or error detected after 8s — marking FAILED")
+    return "FAILED"
+
+
 class GreenhouseApplyAgent(BaseApplyAgent):
     def run_apply_flow(self, page: Page, application: Application, candidate_profile: dict, result: dict):
         url = application.job.url
@@ -267,7 +343,7 @@ class GreenhouseApplyAgent(BaseApplyAgent):
         page.goto(url)
         page.wait_for_load_state("networkidle")
 
-        form_found = resolve_apply_form(page, result["logs"], app_id=application.id)
+        form_found, is_iframe_embed = resolve_apply_form(page, result["logs"], app_id=application.id)
         if not form_found:
             result["logs"].append(
                 "No apply form found after exhausting all strategies. "
@@ -277,6 +353,11 @@ class GreenhouseApplyAgent(BaseApplyAgent):
             return
 
         result["logs"].append(f"Apply form located at: {page.url}")
+        if is_iframe_embed:
+            result["logs"].append("Form is inside an iframe — switching to iframe frame context")
+
+        # Work inside the frame that actually contains the form
+        frame = get_form_frame(page, is_iframe_embed)
 
         try:
             page.screenshot(path=f"data/debug_initial_{application.id}.png")
@@ -284,40 +365,48 @@ class GreenhouseApplyAgent(BaseApplyAgent):
             pass
 
         def fill_and_blur(selector: str, value: str):
-            page.fill(selector, value)
-            page.locator(selector).evaluate(
+            frame.fill(selector, value)
+            frame.locator(selector).evaluate(
                 "el => el.dispatchEvent(new Event('blur', { bubbles: true }))"
             )
 
-        fill_and_blur("input#first_name", candidate_profile.get("first_name", ""))
-        fill_and_blur("input#last_name",  candidate_profile.get("last_name",  ""))
-        fill_and_blur("input#email",      candidate_profile.get("email",      ""))
+        try:
+            fill_and_blur("input#first_name", candidate_profile.get("first_name", ""))
+            fill_and_blur("input#last_name",  candidate_profile.get("last_name",  ""))
+            fill_and_blur("input#email",      candidate_profile.get("email",      ""))
+        except Exception as e:
+            result["logs"].append(f"FAILED filling basic fields (first/last/email): {e}")
+            result["status"] = "FAILED"
+            return
 
         country_from_profile = candidate_profile.get("country", "India")
         result["logs"].append(f"Setting phone country selector to '{country_from_profile}'")
-        ok = _fill_react_select(page, "country", country_from_profile, result["logs"])
+        ok = _fill_react_select(frame, "country", country_from_profile, result["logs"])
         if not ok:
             result["logs"].append("WARNING: country selector failed")
 
         raw_phone = candidate_profile.get("phone", "")
         clean_phone = _clean_phone(raw_phone)
         result["logs"].append(f"Phone cleaned: '{raw_phone}' -> '{clean_phone}'")
-        fill_and_blur("input#phone", clean_phone)
-        page.wait_for_timeout(500)
+        try:
+            fill_and_blur("input#phone", clean_phone)
+        except Exception as e:
+            result["logs"].append(f"WARNING: phone fill failed: {e}")
+        frame.wait_for_timeout(500)
 
         if application.tailored_resume_pdf_path and os.path.exists(application.tailored_resume_pdf_path):
             try:
-                resume_input = page.locator("input[type='file']")
+                resume_input = frame.locator("input[type='file']")
                 if resume_input.count() > 0:
                     resume_input.first.set_input_files(application.tailored_resume_pdf_path)
                     result["logs"].append(f"Resume uploaded via file input: {application.tailored_resume_pdf_path}")
                 else:
-                    attach_btn = page.locator("button:has-text('Attach'), label:has-text('Attach')").first
+                    attach_btn = frame.locator("button:has-text('Attach'), label:has-text('Attach')").first
                     with page.expect_file_chooser() as fc_info:
                         attach_btn.click()
                     fc_info.value.set_files(application.tailored_resume_pdf_path)
                     result["logs"].append(f"Resume uploaded via Attach button: {application.tailored_resume_pdf_path}")
-                page.wait_for_timeout(1000)
+                frame.wait_for_timeout(1000)
             except Exception as e:
                 result["logs"].append(f"Resume upload failed: {e}")
         else:
@@ -326,7 +415,7 @@ class GreenhouseApplyAgent(BaseApplyAgent):
             )
 
         try:
-            questions_data = page.evaluate("""() => {
+            questions_data = frame.evaluate("""() => {
                 const fields = [];
                 const skip = new Set(['first_name','last_name','email','phone','country']);
                 const els = document.querySelectorAll(
@@ -382,14 +471,14 @@ class GreenhouseApplyAgent(BaseApplyAgent):
 
             for field in questions_data:
                 if field.get("type") == "react-select":
-                    real_opts = _get_react_select_options(page, field["id"])
+                    real_opts = _get_react_select_options(frame, field["id"])
                     if not real_opts:
                         hint = TYPEAHEAD_FIELD_HINTS.get(
                             field["id"],
                             field.get("label", "").split()[0] if field.get("label") else ""
                         )
                         if hint:
-                            real_opts = _get_react_select_options_typeahead(page, field["id"], hint)
+                            real_opts = _get_react_select_options_typeahead(frame, field["id"], hint)
                             if real_opts:
                                 result["logs"].append(
                                     f"Typeahead scraped options for {field['id']} (hint='{hint}'): {real_opts}"
@@ -451,6 +540,7 @@ CRITICAL RULE FOR react-select FIELDS:
 - For disability: pick the option that means 'No disability'.
 - For veteran: pick the option that means 'not a veteran'.
 - For skill level scales (e.g. ['Poor', 'Fair', 'Average', 'Good', 'Excellent'] or ['0', '1', '2', '3', '4', '5']): pick an appropriate level based on the candidate's skills.
+- For multi-select checkbox-style questions (e.g. 'Which areas do you work in?'), return a comma-separated string of the options that apply.
 
 CRITICAL RULE FOR checkbox FIELDS:
 - Return the `id` of the checkbox option to check (from the options array).
@@ -468,7 +558,6 @@ Return a flat JSON object: keys = field `id`, values = the answer string (or omi
             answers.update(pre_resolved)
 
             for field_id, answer_val in answers.items():
-                # Fix 2: skip null / empty answers from LLM entirely
                 if not field_id:
                     continue
                 if answer_val is None or str(answer_val).strip() == "":
@@ -490,43 +579,51 @@ Return a flat JSON object: keys = field `id`, values = the answer string (or omi
                     ftype = field_info.get("type", "text")
 
                     if ftype == "react-select":
-                        ok = _fill_react_select(page, field_info["id"], str(answer_val), result["logs"])
+                        ok = _fill_react_select(frame, field_info["id"], str(answer_val), result["logs"])
                         if not ok:
                             result["logs"].append(f"WARNING: react-select failed for {field_id} = '{answer_val}'")
                             if not field_info.get("options"):
                                 try:
-                                    # Fix 1: safe selector for typeahead fallback too
-                                    page.locator(f"input{_safe_css_id(field_info['id'])}").fill(str(answer_val), timeout=3000)
+                                    frame.locator(f"input{_safe_css_id(field_info['id'])}").fill(str(answer_val), timeout=3000)
                                     result["logs"].append(f"Typeahead plain-fill fallback: {field_id} = '{answer_val}'")
                                 except Exception:
                                     pass
 
                     elif ftype == "checkbox":
-                        target_id = str(answer_val)
+                        target_ids = [s.strip() for s in str(answer_val).split(",") if s.strip()]
                         opts = field_info.get("options", [])
                         valid_ids = {o.get("id") for o in opts}
-                        if target_id not in valid_ids and opts:
-                            affirmative = next(
-                                (o for o in opts if o.get("label", "").lower() in ("yes", "i agree", "true")),
-                                opts[0]
-                            )
-                            target_id = affirmative["id"]
-                            result["logs"].append(f"Checkbox: LLM returned invalid id '{answer_val}', using fallback '{target_id}'")
-                        page.locator(f"[id='{target_id}']").check(force=True, timeout=5000)
+                        for target_id in target_ids:
+                            if target_id not in valid_ids and opts:
+                                # Fallback: try matching by label
+                                matched_opt = next(
+                                    (o for o in opts if target_id.lower() in o.get("label", "").lower()),
+                                    None
+                                )
+                                if matched_opt:
+                                    target_id = matched_opt["id"]
+                                    result["logs"].append(f"Checkbox: label-matched id -> '{target_id}'")
+                                else:
+                                    result["logs"].append(f"Checkbox: skipping invalid id '{target_id}'")
+                                    continue
+                            try:
+                                frame.locator(f"[id='{target_id}']").check(force=True, timeout=5000)
+                                result["logs"].append(f"Checked checkbox '{target_id}'")
+                            except Exception as e:
+                                result["logs"].append(f"Checkbox check failed for '{target_id}': {e}")
 
                     elif ftype == "radio":
-                        el = page.locator(f"[id='{answer_val}']")
+                        el = frame.locator(f"[id='{answer_val}']")
                         el.click(force=True, timeout=5000)
                         el.evaluate("el => el.dispatchEvent(new Event('change', { bubbles: true }))")
 
                     else:
-                        # Fix 1: always use attribute selector, never # shorthand
                         sel = (
                             f"[id='{field_info['id']}']" if field_info["id"]
                             else f"[name='{field_info['name']}']"
                         )
-                        page.locator(sel).fill(str(answer_val), timeout=5000)
-                        page.locator(sel).evaluate(
+                        frame.locator(sel).fill(str(answer_val), timeout=5000)
+                        frame.locator(sel).evaluate(
                             "el => el.dispatchEvent(new Event('blur', { bubbles: true }))"
                         )
 
@@ -538,7 +635,7 @@ Return a flat JSON object: keys = field `id`, values = the answer string (or omi
         except Exception as e:
             result["logs"].append(f"Error processing custom questions: {e}")
 
-        page.wait_for_timeout(1500)
+        frame.wait_for_timeout(1500)
 
         try:
             page.screenshot(path=f"data/debug_before_submit_{application.id}.png", full_page=True)
@@ -546,11 +643,12 @@ Return a flat JSON object: keys = field `id`, values = the answer string (or omi
         except Exception:
             pass
 
+        # Pre-submit validation check
         try:
-            raw_errors = page.locator(
-                ".field_with_errors, [class*='error']:visible, [class*='invalid']:visible"
+            raw_errors = frame.locator(
+                ".field_with_errors, [class*='error']:visible, [class*='invalid']:visible, [aria-invalid='true']:visible"
             ).all_inner_texts()
-            blocking = [e.strip() for e in raw_errors if "required" in e.lower()]
+            blocking = [e.strip() for e in raw_errors if e.strip() and "required" in e.lower()]
             if blocking:
                 result["logs"].append(f"BLOCKED SUBMIT - validation errors: {blocking}")
                 result["status"] = "VALIDATION_FAILED"
@@ -558,22 +656,28 @@ Return a flat JSON object: keys = field `id`, values = the answer string (or omi
         except Exception:
             pass
 
-        page.wait_for_timeout(500)
+        frame.wait_for_timeout(500)
+        pre_submit_url = page.url
 
         try:
-            submit_btn = page.locator("input#submit_app, button#submit_app, button[type='submit']")
+            submit_btn = frame.locator("input#submit_app, button#submit_app, button[type='submit']")
             if submit_btn.count() > 0:
                 submit_btn.first.click()
                 result["logs"].append("Submit clicked.")
-                page.wait_for_timeout(4000)
-                try:
-                    errs = page.locator(".error-message, .field_with_errors").all_inner_texts()
-                    if errs:
-                        result["logs"].append(f"Post-submit errors: {errs}")
-                        result["status"] = "VALIDATION_FAILED"
-                except Exception:
-                    pass
+
+                # Wait for a concrete outcome instead of blind sleep
+                outcome = _wait_for_submit_outcome(page, pre_submit_url, result["logs"])
+                result["status"] = outcome
+
+                if outcome == "AUTO_APPLIED":
+                    try:
+                        page.screenshot(path=f"data/success_{application.id}.png")
+                        result["logs"].append(f"Success screenshot: data/success_{application.id}.png")
+                    except Exception:
+                        pass
             else:
                 result["logs"].append("Submit button not found.")
+                result["status"] = "FAILED"
         except Exception as e:
             result["logs"].append(f"Submit error: {e}")
+            result["status"] = "FAILED"
