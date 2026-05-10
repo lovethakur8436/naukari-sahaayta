@@ -4,6 +4,7 @@ from app.apply_agent.form_resolver import resolve_apply_form, get_form_frame
 from app.models.application import Application
 import json
 import os
+import glob
 import re
 from groq import Groq
 
@@ -19,7 +20,56 @@ def _safe_css_id(field_id: str) -> str:
     return f"[id='{field_id}']"
 
 
-def _get_react_select_options(frame, field_id: str) -> list[str]:
+# ─────────────────────────────────────────────────────────────────────────────
+# Resume path resolver
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_resume_path(application: Application, logs: list) -> str | None:
+    """
+    Return the best available resume PDF path for this application.
+
+    Priority:
+      1. application.tailored_resume_pdf_path   (job-specific tailored PDF)
+      2. data/base_resume.pdf                   (generic base resume fallback)
+      3. First match of data/resume_*.pdf glob  (any previously compiled resume)
+
+    Returns None if nothing is found — caller logs a warning and skips upload.
+    """
+    # 1. Tailored PDF
+    tailored = getattr(application, 'tailored_resume_pdf_path', None)
+    if tailored and os.path.exists(tailored):
+        logs.append(f"Resume: using tailored PDF '{tailored}'")
+        return tailored
+    if tailored:
+        logs.append(f"Resume: tailored path '{tailored}' does not exist — trying fallbacks")
+
+    # 2. Base resume
+    base = "data/base_resume.pdf"
+    if os.path.exists(base):
+        logs.append(f"Resume: tailored PDF missing, falling back to base resume '{base}'")
+        return base
+
+    # 3. Any compiled resume in data/
+    candidates = sorted(glob.glob("data/resume_*.pdf"), key=os.path.getmtime, reverse=True)
+    if candidates:
+        logs.append(
+            f"Resume: no base resume found, using most-recent compiled PDF '{candidates[0]}'"
+        )
+        return candidates[0]
+
+    logs.append(
+        "Resume: WARNING — no PDF found (tailored missing, no base_resume.pdf, no data/resume_*.pdf). "
+        "Skipping upload — application will likely be rejected."
+    )
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# react-select helpers
+# NOTE: `page` is always the root Page object — Frame does not have .keyboard
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_react_select_options(frame, field_id: str, page: Page = None) -> list[str]:
     control_div = frame.locator(
         f"xpath=//input[@id='{field_id}']/ancestor::div[contains(@class,'select__control')]"
     )
@@ -40,12 +90,21 @@ def _get_react_select_options(frame, field_id: str) -> list[str]:
         except Exception:
             pass
 
-    frame.keyboard.press("Escape")
+    # Frame has no .keyboard — always use the root Page object
+    try:
+        kb = page.keyboard if page is not None else None
+        if kb:
+            kb.press("Escape")
+        else:
+            # Fallback: click somewhere neutral to close the dropdown
+            frame.locator("body").click(position={"x": 5, "y": 5}, timeout=1000)
+    except Exception:
+        pass
     frame.wait_for_timeout(200)
     return texts
 
 
-def _get_react_select_options_typeahead(frame, field_id: str, search_term: str) -> list[str]:
+def _get_react_select_options_typeahead(frame, field_id: str, search_term: str, page: Page = None) -> list[str]:
     input_el = frame.locator(f"input{_safe_css_id(field_id)}")
     control_div = frame.locator(
         f"xpath=//input[@id='{field_id}']/ancestor::div[contains(@class,'select__control')]"
@@ -56,7 +115,12 @@ def _get_react_select_options_typeahead(frame, field_id: str, search_term: str) 
         input_el.type(search_term[:10], delay=60)
         frame.wait_for_timeout(800)
     except Exception:
-        frame.keyboard.press("Escape")
+        try:
+            kb = page.keyboard if page is not None else None
+            if kb:
+                kb.press("Escape")
+        except Exception:
+            pass
         return []
 
     options = frame.locator(f"[id^='react-select-{field_id}-option']")
@@ -70,17 +134,25 @@ def _get_react_select_options_typeahead(frame, field_id: str, search_term: str) 
         except Exception:
             pass
 
-    frame.keyboard.press("Escape")
+    # Frame has no .keyboard — always use the root Page object
+    try:
+        kb = page.keyboard if page is not None else None
+        if kb:
+            kb.press("Escape")
+        else:
+            frame.locator("body").click(position={"x": 5, "y": 5}, timeout=1000)
+    except Exception:
+        pass
     frame.wait_for_timeout(200)
     return texts
 
 
-def _fill_react_select(frame, field_id: str, answer_text: str, logs: list) -> bool:
+def _fill_react_select(frame, field_id: str, answer_text: str, logs: list, page: Page = None) -> bool:
     """
     Fill a react-select dropdown.
     - Uses safe attribute selectors to avoid CSS crash on IDs containing [].
-    - Skips entirely when answer_text is empty/null — avoids silently picking
-      the first option (e.g. 'she/her/hers', '0-2 years').
+    - Skips entirely when answer_text is empty/null.
+    - Uses page.keyboard (not frame.keyboard) for Escape presses.
     """
     if not answer_text or not answer_text.strip():
         logs.append(f"react-select: skipping '{field_id}' — LLM returned empty answer, leaving blank")
@@ -89,7 +161,6 @@ def _fill_react_select(frame, field_id: str, answer_text: str, logs: list) -> bo
     control_div = frame.locator(
         f"xpath=//input[@id='{field_id}']/ancestor::div[contains(@class,'select__control')]"
     )
-    # Always use attribute selector — never bare #id which crashes on foo[]
     input_el = frame.locator(f"input{_safe_css_id(field_id)}")
 
     try:
@@ -101,12 +172,10 @@ def _fill_react_select(frame, field_id: str, answer_text: str, logs: list) -> bo
 
     first_word = answer_text.split()[0]
     try:
-        # Use attribute selector for type() too — avoids bracket-ID crash
         input_el.type(first_word, delay=50)
         frame.wait_for_timeout(500)
     except Exception as e:
         logs.append(f"react-select type failed for {field_id}: {e}")
-        # Don't return — listbox may still be open with options
 
     listbox = frame.locator(f"[id='react-select-{field_id}-listbox'], div[role='listbox']").first
     try:
@@ -122,7 +191,12 @@ def _fill_react_select(frame, field_id: str, answer_text: str, logs: list) -> bo
 
     if count == 0:
         logs.append(f"react-select: no options after typing '{first_word}' for {field_id}")
-        frame.keyboard.press("Escape")
+        try:
+            kb = page.keyboard if page is not None else None
+            if kb:
+                kb.press("Escape")
+        except Exception:
+            pass
         return False
 
     option_texts = []
@@ -156,7 +230,12 @@ def _fill_react_select(frame, field_id: str, answer_text: str, logs: list) -> bo
 
     if matched_idx is None:
         logs.append(f"react-select: NO MATCH for '{answer_text}' in {option_texts}")
-        frame.keyboard.press("Escape")
+        try:
+            kb = page.keyboard if page is not None else None
+            if kb:
+                kb.press("Escape")
+        except Exception:
+            pass
         return False
 
     try:
@@ -264,9 +343,9 @@ def _call_llm_with_fallback(prompt: str, logs: list) -> dict:
         raise RuntimeError(f"Gemini Flash also failed: {gemini_err}") from gemini_err
 
 
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Submit helpers
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 _CONFIRMATION_SELECTORS = [
     "[class*='confirmation']:visible",
@@ -289,19 +368,11 @@ _POST_SUBMIT_ERROR_SELECTORS = [
 
 
 def _wait_for_submit_outcome(page_or_frame, pre_submit_url: str, logs: list) -> str:
-    """
-    After clicking Submit, wait up to 8 s for one of:
-      - A confirmation element   -> return 'AUTO_APPLIED'
-      - URL change away from /apply -> return 'AUTO_APPLIED'
-      - A visible error element  -> return 'VALIDATION_FAILED'
-    If neither seen -> return 'FAILED'
-    """
     import time
     deadline = time.monotonic() + 8
     poll_ms = 600
 
     while time.monotonic() < deadline:
-        # Check URL change (works on page object, not frame)
         try:
             current_url = page_or_frame.url
             if "/apply" in pre_submit_url.lower() and "/apply" not in current_url.lower():
@@ -310,7 +381,6 @@ def _wait_for_submit_outcome(page_or_frame, pre_submit_url: str, logs: list) -> 
         except Exception:
             pass
 
-        # Check confirmation elements
         for sel in _CONFIRMATION_SELECTORS:
             try:
                 if page_or_frame.locator(sel).count() > 0:
@@ -319,7 +389,6 @@ def _wait_for_submit_outcome(page_or_frame, pre_submit_url: str, logs: list) -> 
             except Exception:
                 pass
 
-        # Check error elements
         for sel in _POST_SUBMIT_ERROR_SELECTORS:
             try:
                 els = page_or_frame.locator(sel).all_inner_texts()
@@ -381,7 +450,8 @@ class GreenhouseApplyAgent(BaseApplyAgent):
 
         country_from_profile = candidate_profile.get("country", "India")
         result["logs"].append(f"Setting phone country selector to '{country_from_profile}'")
-        ok = _fill_react_select(frame, "country", country_from_profile, result["logs"])
+        # Pass root `page` for keyboard access — Frame has no .keyboard
+        ok = _fill_react_select(frame, "country", country_from_profile, result["logs"], page=page)
         if not ok:
             result["logs"].append("WARNING: country selector failed")
 
@@ -394,25 +464,24 @@ class GreenhouseApplyAgent(BaseApplyAgent):
             result["logs"].append(f"WARNING: phone fill failed: {e}")
         frame.wait_for_timeout(500)
 
-        if application.tailored_resume_pdf_path and os.path.exists(application.tailored_resume_pdf_path):
+        # ── Resume upload with fallback resolution ──────────────────────────
+        resume_path = _resolve_resume_path(application, result["logs"])
+        if resume_path:
             try:
                 resume_input = frame.locator("input[type='file']")
                 if resume_input.count() > 0:
-                    resume_input.first.set_input_files(application.tailored_resume_pdf_path)
-                    result["logs"].append(f"Resume uploaded via file input: {application.tailored_resume_pdf_path}")
+                    resume_input.first.set_input_files(resume_path)
+                    result["logs"].append(f"Resume uploaded via file input: {resume_path}")
                 else:
                     attach_btn = frame.locator("button:has-text('Attach'), label:has-text('Attach')").first
                     with page.expect_file_chooser() as fc_info:
                         attach_btn.click()
-                    fc_info.value.set_files(application.tailored_resume_pdf_path)
-                    result["logs"].append(f"Resume uploaded via Attach button: {application.tailored_resume_pdf_path}")
+                    fc_info.value.set_files(resume_path)
+                    result["logs"].append(f"Resume uploaded via Attach button: {resume_path}")
                 frame.wait_for_timeout(1000)
             except Exception as e:
                 result["logs"].append(f"Resume upload failed: {e}")
-        else:
-            result["logs"].append(
-                f"WARNING: No resume PDF found at '{application.tailored_resume_pdf_path}'. Skipping upload."
-            )
+        # If resume_path is None, _resolve_resume_path already logged the warning
 
         try:
             questions_data = frame.evaluate("""() => {
@@ -471,14 +540,17 @@ class GreenhouseApplyAgent(BaseApplyAgent):
 
             for field in questions_data:
                 if field.get("type") == "react-select":
-                    real_opts = _get_react_select_options(frame, field["id"])
+                    # Pass root `page` to avoid Frame.keyboard crash
+                    real_opts = _get_react_select_options(frame, field["id"], page=page)
                     if not real_opts:
                         hint = TYPEAHEAD_FIELD_HINTS.get(
                             field["id"],
                             field.get("label", "").split()[0] if field.get("label") else ""
                         )
                         if hint:
-                            real_opts = _get_react_select_options_typeahead(frame, field["id"], hint)
+                            real_opts = _get_react_select_options_typeahead(
+                                frame, field["id"], hint, page=page
+                            )
                             if real_opts:
                                 result["logs"].append(
                                     f"Typeahead scraped options for {field['id']} (hint='{hint}'): {real_opts}"
@@ -579,7 +651,9 @@ Return a flat JSON object: keys = field `id`, values = the answer string (or omi
                     ftype = field_info.get("type", "text")
 
                     if ftype == "react-select":
-                        ok = _fill_react_select(frame, field_info["id"], str(answer_val), result["logs"])
+                        ok = _fill_react_select(
+                            frame, field_info["id"], str(answer_val), result["logs"], page=page
+                        )
                         if not ok:
                             result["logs"].append(f"WARNING: react-select failed for {field_id} = '{answer_val}'")
                             if not field_info.get("options"):
@@ -595,7 +669,6 @@ Return a flat JSON object: keys = field `id`, values = the answer string (or omi
                         valid_ids = {o.get("id") for o in opts}
                         for target_id in target_ids:
                             if target_id not in valid_ids and opts:
-                                # Fallback: try matching by label
                                 matched_opt = next(
                                     (o for o in opts if target_id.lower() in o.get("label", "").lower()),
                                     None
@@ -665,7 +738,6 @@ Return a flat JSON object: keys = field `id`, values = the answer string (or omi
                 submit_btn.first.click()
                 result["logs"].append("Submit clicked.")
 
-                # Wait for a concrete outcome instead of blind sleep
                 outcome = _wait_for_submit_outcome(page, pre_submit_url, result["logs"])
                 result["status"] = outcome
 
