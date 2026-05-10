@@ -1,12 +1,13 @@
 % ============================================================
 % NAUKARI-SAHAAYTA — ATS-SAFE ONE-PAGE RESUME TEMPLATE
-% Based on Jake's Resume style. DO NOT EDIT LAYOUT/GEOMETRY.
-% Only DATA placeholders (<<...>>) are substituted at runtime.
+% Professional dense layout inspired by Jake's Resume.
+% DO NOT EDIT LAYOUT/GEOMETRY — only <<...>> placeholders
+% are substituted at runtime by engine.py.
 % ============================================================
-\documentclass[10pt, letterpaper]{article}
+\documentclass[9.5pt, letterpaper]{article}
 
 % ---------- Packages ----------
-\usepackage[top=0.45in, bottom=0.45in, left=0.5in, right=0.5in]{geometry}
+\usepackage[top=0.35in, bottom=0.35in, left=0.45in, right=0.45in]{geometry}
 \usepackage{latexsym}
 \usepackage[empty]{fullpage}
 \usepackage{titlesec}
@@ -18,7 +19,8 @@
 \usepackage{fancyhdr}
 \usepackage[english]{babel}
 \usepackage{tabularx}
-\usepackage{fontenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
 \input{glyphtounicode}
 
 % ---------- ATS Readability ----------
@@ -38,57 +40,69 @@
 \raggedbottom
 \raggedright
 \setlength{\tabcolsep}{0in}
+\setlength{\parskip}{0pt}
+\setlength{\parsep}{0pt}
 
 % ---------- Section formatting ----------
+% Dense horizontal rule under each section heading
 \titleformat{\section}{
-  \vspace{-4pt}\scshape\raggedright\large
-}{}{0em}{}[\color{black}\titlerule \vspace{-5pt}]
+  \vspace{-6pt}\scshape\raggedright\normalsize\bfseries
+}{}{0em}{}[\color{black}\titlerule \vspace{-4pt}]
 
 % ---------- Custom commands ----------
 \newcommand{\resumeItem}[1]{
-  \item\small{{#1 \vspace{-2pt}}}
+  \item\small{
+    {#1}\vspace{-1pt}
+  }
 }
 
 \newcommand{\resumeSubheading}[4]{
-  \vspace{-2pt}\item
-    \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
-      \textbf{#1} & #2 \\
+  \vspace{-1pt}\item
+    \begin{tabular*}{0.98\textwidth}[t]{l@{\extracolsep{\fill}}r}
+      \textbf{\small#1} & {\small #2} \\
       \textit{\small#3} & \textit{\small #4} \\
-    \end{tabular*}\vspace{-7pt}
+    \end{tabular*}\vspace{-6pt}
 }
 
 \newcommand{\resumeProjectHeading}[2]{
-    \item
-    \begin{tabular*}{0.97\textwidth}{l@{\extracolsep{\fill}}r}
-      \small#1 & #2 \\
-    \end{tabular*}\vspace{-7pt}
+  \vspace{-1pt}\item
+    \begin{tabular*}{0.98\textwidth}{l@{\extracolsep{\fill}}r}
+      \small#1 & \small#2 \\
+    \end{tabular*}\vspace{-6pt}
 }
 
-\newcommand{\resumeSubItem}[1]{\resumeItem{#1}\vspace{-4pt}}
+\newcommand{\resumeSubItem}[1]{\resumeItem{#1}\vspace{-3pt}}
 
 \renewcommand\labelitemii{$\vcenter{\hbox{\tiny$\bullet$}}$}
 
-\newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=0.15in, label={}]}
-\newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
-\newcommand{\resumeItemListStart}{\begin{itemize}[leftmargin=0.15in, itemsep=0pt, parsep=0pt, topsep=0pt]}
-\newcommand{\resumeItemListEnd}{\end{itemize}\vspace{-5pt}}
+\newcommand{\resumeSubHeadingListStart}{
+  \begin{itemize}[leftmargin=0.12in, label={}, itemsep=0pt, parsep=0pt, topsep=2pt]
+}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}\vspace{-2pt}}
+
+\newcommand{\resumeItemListStart}{
+  \begin{itemize}[leftmargin=0.18in, label={\tiny$\bullet$}, itemsep=0pt, parsep=0pt, topsep=2pt]
+}
+\newcommand{\resumeItemListEnd}{\end{itemize}\vspace{-4pt}}
 
 % ============================================================
 \begin{document}
 
 % ---------- HEADER ----------
 \begin{center}
-    {\Huge \scshape <<FULL_NAME>>} \\ \vspace{1pt}
-    \small <<PHONE>> $|$
-    \href{mailto:<<EMAIL>>}{\underline{<<EMAIL>>}} $|$
-    \href{<<LINKEDIN>>}{\underline{LinkedIn}} $|$
+    {\large \textbf{\scshape <<FULL_NAME>>}} \\ \vspace{2pt}
+    \small
+    <<PHONE>> $\cdot$
+    \href{mailto:<<EMAIL>>}{\underline{<<EMAIL>>}} $\cdot$
+    \href{<<LINKEDIN>>}{\underline{LinkedIn}} $\cdot$
     \href{<<GITHUB>>}{\underline{GitHub}}
 \end{center}
+\vspace{-6pt}
 
 % ---------- SUMMARY ----------
 \section{Summary}
-  <<SUMMARY>>
-\vspace{-4pt}
+  \small <<SUMMARY>>
+\vspace{-2pt}
 
 % ---------- EXPERIENCE ----------
 \section{Experience}
@@ -110,7 +124,7 @@
 
 % ---------- TECHNICAL SKILLS ----------
 \section{Technical Skills}
- \begin{itemize}[leftmargin=0.15in, label={}, itemsep=0pt, parsep=0pt]
+ \begin{itemize}[leftmargin=0.12in, label={}, itemsep=1pt, parsep=0pt, topsep=2pt]
 <<SKILLS_ROWS>>
  \end{itemize}
 

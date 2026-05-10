@@ -149,16 +149,12 @@ _SCAN_REQUIRED_JS = (
     "            && document.querySelector('label[for=\"' + el.id + '\"]').innerText.includes('*'));"
     "    if (!req) return;"
     "    if ((el.value || '').trim() !== '') return;"
-    # FIX: candidate-location is handled by _fill_location_typeahead.
-    # Remove it from the scan so submitGuard doesn't try to re-fill it
-    # via react-select (which was causing the Australia/Hyderabad corruption).
-    # We only re-fill it via the dedicated typeahead path below.
     "    if (el.id === 'candidate-location') { empty.push({ id: el.id, name: el.name, label: 'Location (City)', type: 'location-typeahead' }); return; }"
     "    var lbl = (document.querySelector('label[for=\"' + el.id + '\"]') || {}).innerText || '';"
     "    lbl = lbl.replace('*','').trim() || el.placeholder || el.name || el.id;"
     "    empty.push({ id: el.id, name: el.name, label: lbl, type: 'text' });"
     "  });"
-    # ── react-select combobox — check value container, not placeholder ───
+    # ── react-select combobox ────────────────────────────────────────────
     "  document.querySelectorAll('input[role=\"combobox\"]').forEach(function(el) {"
     "    if (skip.has(el.id)) return;"
     "    if (el.offsetWidth === 0 && el.offsetHeight === 0) return;"
@@ -214,31 +210,206 @@ def _scan_required_empty(frame, logs: list) -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Escape any open react-select dropdown before the next fill
-# FIX ROOT CAUSE: After filling a react-select (e.g. country = India), the
-# listbox sometimes stays open/focused. The NEXT react-select fill then calls
-# control_div.click() which re-opens the SAME already-focused dropdown instead
-# of the new field's dropdown — causing every subsequent value to be typed
-# into the country field (producing 'Australia', 'Yes', 'No' in country).
-# Solution: always Escape + blur before starting the next field fill.
+# FIX: Fully close any open react-select dropdown before touching the next
+# field. The strategy:
+#   1. Press Escape (keyboard event — closes most react-select dropdowns)
+#   2. Click a neutral spot on the body (blurs focus away from the select)
+#   3. Wait for any visible listbox to disappear (up to 600ms)
+# Without this, the country field's open listbox intercepts clicks/types
+# meant for subsequent fields (auth, sponsor, remote, etc.).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _close_open_dropdowns(frame, page, logs: list) -> None:
-    """Press Escape + click body to close any stray open react-select listbox."""
+    """Press Escape + blur to close any stray open react-select listbox, then wait."""
     try:
-        open_listbox = frame.locator("div[role='listbox']:visible")
-        if open_listbox.count() > 0:
-            try:
-                if page:
-                    page.keyboard.press("Escape")
-                else:
-                    frame.locator("body").click(position={"x": 5, "y": 5}, timeout=800)
-            except Exception:
-                pass
-            frame.wait_for_timeout(200)
-            logs.append("[submit_guard] Closed stray open dropdown before refill")
+        # Step 1: keyboard Escape
+        try:
+            if page:
+                page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+        # Step 2: click a neutral area to blur
+        try:
+            frame.locator("body").click(position={"x": 5, "y": 5}, timeout=500, force=True)
+        except Exception:
+            pass
+
+        # Step 3: wait for listbox to disappear (max 600ms)
+        try:
+            frame.wait_for_selector(
+                "div[role='listbox']:visible",
+                state="hidden",
+                timeout=600,
+            )
+        except Exception:
+            pass  # already gone or never existed
+
+        frame.wait_for_timeout(150)
     except Exception:
         pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX: Isolated react-select fill — clicks the control for THIS field's id
+# only, not whatever is currently focused.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fill_react_select_isolated(
+    frame,
+    page,
+    field_id: str,
+    value: str,
+    logs: list,
+) -> bool:
+    """
+    Fill a react-select for a specific field_id.
+    Returns True on success.
+
+    Strategy:
+      1. Close any open dropdown first.
+      2. Find the container that owns input#<field_id>.
+      3. Click THAT container's .select__control — not the globally focused one.
+      4. Type to filter, then click the matching option.
+    """
+    _close_open_dropdowns(frame, page, logs)
+
+    try:
+        # Locate the react-select container that wraps THIS field's input
+        container_js = f"""
+        () => {{
+            var inp = document.getElementById('{field_id}');
+            if (!inp) return null;
+            var ctrl = inp.closest('.select__control');
+            if (!ctrl) return null;
+            // Return a unique selector for this control
+            var wrapper = ctrl.closest('.select__container, [class*=\"select\"]') || ctrl.parentElement;
+            return wrapper ? wrapper.id || null : null;
+        }}
+        """
+        # Instead of inspecting DOM, use playwright locator scoped to this input
+        # Find the .select__control sibling of this specific input
+        inp_locator = frame.locator(f"input#{field_id}")
+        if inp_locator.count() == 0:
+            logs.append(f"[guard-isolated] input#{field_id} not found")
+            return False
+
+        # Walk up to the react-select control div
+        ctrl_js = f"""
+        () => {{
+            var inp = document.getElementById('{field_id}');
+            if (!inp) return null;
+            var ctrl = inp.closest('.select__control');
+            return ctrl ? true : false;
+        }}
+        """
+        has_ctrl = frame.evaluate(ctrl_js)
+        if not has_ctrl:
+            logs.append(f"[guard-isolated] no .select__control for #{field_id}")
+            return False
+
+        # Click this specific control (not the global focused one)
+        frame.evaluate(f"""
+        () => {{
+            var inp = document.getElementById('{field_id}');
+            if (inp) {{
+                var ctrl = inp.closest('.select__control');
+                if (ctrl) ctrl.click();
+            }}
+        }}
+        """)
+        frame.wait_for_timeout(300)
+
+        # Type the value to filter options
+        inp_locator.fill("")
+        inp_locator.type(value[:12], delay=40)  # type first 12 chars to filter
+        frame.wait_for_timeout(400)
+
+        # Get visible options from THIS field's listbox
+        opts_js = f"""
+        () => {{
+            var inp = document.getElementById('{field_id}');
+            if (!inp) return [];
+            // The listbox ID is stored in aria-controls
+            var listbox_id = inp.getAttribute('aria-controls');
+            var listbox = listbox_id ? document.getElementById(listbox_id) : null;
+            if (!listbox) {{
+                // Fallback: find nearest visible listbox
+                listbox = document.querySelector("div[role='listbox']:not([style*='display: none'])");
+            }}
+            if (!listbox) return [];
+            return Array.from(listbox.querySelectorAll("div[role='option']")).map(o => o.innerText.trim());
+        }}
+        """
+        options = frame.evaluate(opts_js)
+        if not options:
+            logs.append(f"[guard-isolated] no options visible for #{field_id} after typing '{value}'")
+            _close_open_dropdowns(frame, page, logs)
+            return False
+
+        logs.append(f"[guard-isolated] #{field_id}: {len(options)} options, want '{value}'")
+
+        # Find best match
+        value_lower = value.lower()
+        matched = None
+        # Exact match
+        for opt in options:
+            if opt.lower() == value_lower:
+                matched = opt
+                break
+        # Startswith match
+        if not matched:
+            for opt in options:
+                if opt.lower().startswith(value_lower):
+                    matched = opt
+                    break
+        # Contains match
+        if not matched:
+            for opt in options:
+                if value_lower in opt.lower():
+                    matched = opt
+                    break
+
+        if not matched:
+            logs.append(f"[guard-isolated] no match for '{value}' in {options[:5]}")
+            _close_open_dropdowns(frame, page, logs)
+            return False
+
+        # Click the matched option in THIS field's listbox
+        click_js = f"""
+        (matchedText) => {{
+            var inp = document.getElementById('{field_id}');
+            if (!inp) return false;
+            var listbox_id = inp.getAttribute('aria-controls');
+            var listbox = listbox_id ? document.getElementById(listbox_id) : null;
+            if (!listbox) listbox = document.querySelector("div[role='listbox']:not([style*='display: none'])");
+            if (!listbox) return false;
+            var opts = listbox.querySelectorAll("div[role='option']");
+            for (var o of opts) {{
+                if (o.innerText.trim() === matchedText) {{
+                    o.click();
+                    return true;
+                }}
+            }}
+            return false;
+        }}
+        """
+        clicked = frame.evaluate(click_js, matched)
+        frame.wait_for_timeout(300)
+
+        if clicked:
+            logs.append(f"[guard-isolated] clicked '{matched}' for #{field_id}")
+            _close_open_dropdowns(frame, page, logs)
+            return True
+        else:
+            logs.append(f"[guard-isolated] click failed for '{matched}' in #{field_id}")
+            _close_open_dropdowns(frame, page, logs)
+            return False
+
+    except Exception as exc:
+        logs.append(f"[guard-isolated] error for #{field_id}: {exc}")
+        _close_open_dropdowns(frame, page, logs)
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -316,6 +487,48 @@ def _wait_outcome(page, frame, pre_url: str, logs: list, wait_s: float = 8) -> s
     return "FAILED"
 
 
+def _guard_fill_field(
+    frame,
+    page,
+    ef: dict,
+    field_info: dict,
+    default: str,
+    logs: list,
+    refill_fn,
+) -> None:
+    """
+    Fill a single empty required field during the submit-guard pass.
+
+    FIX for the country-dropdown corruption:
+    - For react-select fields, use _fill_react_select_isolated() which targets
+      the specific field's container via its input ID, not the globally focused element.
+    - Only fall back to refill_fn for non-react-select fields (text, checkbox).
+    - Always close dropdowns before and after every fill.
+    """
+    ftype = ef.get("type")
+    field_id = ef.get("id", "")
+
+    _close_open_dropdowns(frame, page, logs)
+
+    if ftype == "react-select" and field_id:
+        success = _fill_react_select_isolated(frame, page, field_id, default, logs)
+        if not success:
+            # Fallback to original refill_fn path
+            logs.append(f"[guard] isolated fill failed for #{field_id}, falling back to refill_fn")
+            _close_open_dropdowns(frame, page, logs)
+            try:
+                refill_fn(frame, field_info, default, logs, page)
+            except Exception as exc:
+                logs.append(f"[guard] refill_fn fallback error for #{field_id}: {exc}")
+    else:
+        try:
+            refill_fn(frame, field_info, default, logs, page)
+        except Exception as exc:
+            logs.append(f"[guard] refill_fn error for '{field_id}': {exc}")
+
+    _close_open_dropdowns(frame, page, logs)
+
+
 def submit_with_retry(
     page,
     frame,
@@ -351,10 +564,7 @@ def submit_with_retry(
                         logs.append(f"[submit_guard] Resume re-upload failed: {exc}")
                     continue
 
-                # ── location-typeahead: use dedicated helper, not react-select ──
-                # FIX BUG 2: candidate-location must be filled by the typeahead
-                # helper (which types slowly and waits for suggestions), not by
-                # the generic react-select path which targets the wrong element.
+                # ── location-typeahead ──────────────────────────────────
                 if ftype == "location-typeahead" or ef.get("id") == "candidate-location":
                     try:
                         city = candidate_profile.get("location", "Hyderabad, India").split(",")[0].strip()
@@ -368,12 +578,6 @@ def submit_with_retry(
                     except Exception as exc:
                         logs.append(f"[submit_guard] location typeahead refill error: {exc}")
                     continue
-
-                # FIX BUG 1: ALWAYS close any open dropdown BEFORE filling
-                # the next field. Without this, the previously-focused country
-                # dropdown stays open and swallows the next field's fill —
-                # causing 'Australia', 'Yes', 'No' to land in the country field.
-                _close_open_dropdowns(frame, page, logs)
 
                 field_info = next(
                     (q for q in questions_data
@@ -412,21 +616,7 @@ def submit_with_retry(
                         f"[submit_guard] Applying safe default for '{ef['label']}' "
                         f"(id={ef['id']}): '{default}'"
                     )
-                    # FIX BUG 1 (continued): Close dropdown AGAIN just before
-                    # calling refill_fn — a prior field's click can re-open it.
-                    _close_open_dropdowns(frame, page, logs)
-                    try:
-                        refill_fn(frame, field_info, default, logs, page)
-                    except Exception as exc:
-                        logs.append(f"[submit_guard] refill_fn error for '{ef['id']}': {exc}")
-                    # FIX BUG 1: Press Escape after every refill_fn call to
-                    # ensure the dropdown is closed before the next iteration.
-                    try:
-                        if page:
-                            page.keyboard.press("Escape")
-                    except Exception:
-                        pass
-                    frame.wait_for_timeout(200)
+                    _guard_fill_field(frame, page, ef, field_info, default, logs, refill_fn)
                 else:
                     logs.append(
                         f"[submit_guard] No safe default for required field '{ef['label']}' "
@@ -469,7 +659,6 @@ def submit_with_retry(
                 if not matched_field:
                     continue
 
-                # location city — use typeahead path, not react-select
                 if matched_field.get("id") == "candidate-location":
                     try:
                         city = candidate_profile.get("location", "Hyderabad, India").split(",")[0].strip()
@@ -509,17 +698,7 @@ def submit_with_retry(
                     logs.append(
                         f"[submit_guard] Retry re-fill '{matched_field['label']}' -> '{default}'"
                     )
-                    _close_open_dropdowns(frame, page, logs)
-                    try:
-                        refill_fn(frame, matched_field, default, logs, page)
-                    except Exception as exc:
-                        logs.append(f"[submit_guard] Retry refill error: {exc}")
-                    try:
-                        if page:
-                            page.keyboard.press("Escape")
-                    except Exception:
-                        pass
-                    frame.wait_for_timeout(200)
+                    _guard_fill_field(frame, page, matched_field, matched_field, default, logs, refill_fn)
             frame.wait_for_timeout(800)
             continue
 
