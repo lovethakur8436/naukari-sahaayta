@@ -213,11 +213,9 @@ def _run_process_all(
             # ----------------------------------------------------------
             # Step 1: Decide whether to tailor
             # ----------------------------------------------------------
-            # Primary check: status tells us tailor is needed
             needs_tailor = app_entry.status in _NEEDS_TAILOR_STATUSES
 
             # Safety net: status says TAILORED/FAILED but PDF is missing on disk
-            # (e.g. data/ folder was wiped) — force retailor to avoid apply crash
             if not needs_tailor:
                 pdf_ok = (
                     app_entry.tailored_resume_pdf_path
@@ -416,6 +414,29 @@ def get_process_all_status():
     return process_status
 
 
+@app.post("/applications/process-all/reset")
+def reset_process_all_status():
+    """
+    Reset the in-memory process_status back to idle defaults.
+    Call this from the dashboard BEFORE starting a new process-all run
+    so the previous run's stale message is cleared immediately.
+    Only allowed when a run is not currently active.
+    """
+    global process_status
+    if process_status["running"]:
+        return {"message": "Cannot reset — process-all is currently running.", "status": process_status}
+    process_status = {
+        "running": False,
+        "processed": 0,
+        "failed": 0,
+        "remaining": 0,
+        "total": 0,
+        "current_job": "",
+        "message": "idle"
+    }
+    return {"message": "Process-all status reset to idle.", "status": process_status}
+
+
 # ------------------------------------------------------------------ #
 # Applications                                                         #
 # ------------------------------------------------------------------ #
@@ -449,10 +470,8 @@ def read_applications(
     q = db.query(Application)
 
     if status:
-        # Explicit status filter overrides include_applied
         q = q.filter(Application.status == status.upper())
     elif not include_applied:
-        # Default: show everything EXCEPT successfully applied jobs
         q = q.filter(Application.status.notin_(list(_APPLIED_STATUSES)))
 
     if min_score is not None:
