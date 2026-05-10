@@ -140,6 +140,14 @@ Bachelor of Technology, Computer Science Engineering 2018 – 2022""")
     {"category": "DevOps", "items": ["Ansible", "Jenkins CI/CD", "GitHub Actions", "Docker", "Kubernetes", "Linux"]},
     {"category": "Cloud", "items": ["AWS (EC2, S3, Lambda)", "Firebase Hosting"]},
     {"category": "Databases", "items": ["PostgreSQL", "MongoDB", "Redis", "Grafana", "Splunk"]}
+  ],
+  "education": [
+    {
+      "institution": "Dr. A.P.J. Abdul Kalam Technical University",
+      "location": "Lucknow, India",
+      "degree": "Bachelor of Technology, Computer Science Engineering",
+      "dates": "2018 – 2022"
+    }
   ]
 }''')
 
@@ -237,7 +245,9 @@ with tab1:
 with tab2:
     st.header("Application Queue")
 
-    # --- Auto-Process All controls ---
+    # ------------------------------------------------------------------ #
+    # Bulk Automation                                                      #
+    # ------------------------------------------------------------------ #
     st.subheader("Bulk Automation")
     proc_col1, proc_col2, proc_col3 = st.columns([2, 1, 1])
     with proc_col1:
@@ -253,49 +263,96 @@ with tab2:
     with proc_col3:
         st.write("")
         st.write("")
-        if st.button("▶▶ Auto-Process All", help="Tailor + Apply all qualifying apps in background"):
-            profile = {
-                "first_name": first_name, "last_name": last_name,
-                "email": email, "phone": phone,
-                "linkedin": linkedin_url, "github": github_url,
-                "portfolio": portfolio_url, "location": location_input,
-                "work_auth": work_auth, "gender": gender,
-                "hispanic": hispanic, "veteran": veteran,
-                "disability": disability
-            }
-            try:
-                res = requests.post(
-                    f"{API_URL}/applications/process-all",
-                    json={
-                        "base_resume_json": json.loads(base_resume_json),
-                        "candidate_profile": profile,
-                        "fit_threshold": float(fit_threshold),
-                        "delay": proc_delay
-                    }
-                )
-                if res.status_code == 200:
-                    st.success("✅ Auto-process started! You can freely use the dashboard.")
-                else:
-                    st.error(f"Error: {res.text}")
-            except json.JSONDecodeError:
-                st.error("Base Resume JSON is invalid. Fix it in the Setup tab.")
+        auto_process_clicked = st.button(
+            "▶▶ Auto-Process All",
+            help="Tailor + Apply all qualifying apps in background"
+        )
 
-    # --- Process-All Status widget ---
+    if auto_process_clicked:
+        # ----------------------------------------------------------------
+        # FIX 1: Reset stale in-memory status on the backend BEFORE
+        # starting a new run, so the UI never shows the previous run's
+        # "Done! Applied to 0 jobs." message for the new run.
+        # ----------------------------------------------------------------
+        try:
+            requests.post(f"{API_URL}/applications/process-all/reset", timeout=3)
+        except Exception:
+            pass  # reset endpoint missing on older server — non-fatal
+
+        profile = {
+            "first_name": first_name, "last_name": last_name,
+            "email": email, "phone": phone,
+            "linkedin": linkedin_url, "github": github_url,
+            "portfolio": portfolio_url, "location": location_input,
+            "work_auth": work_auth, "gender": gender,
+            "hispanic": hispanic, "veteran": veteran,
+            "disability": disability
+        }
+        try:
+            res = requests.post(
+                f"{API_URL}/applications/process-all",
+                json={
+                    "base_resume_json": json.loads(base_resume_json),
+                    "candidate_profile": profile,
+                    "fit_threshold": float(fit_threshold),
+                    "delay": proc_delay
+                }
+            )
+            if res.status_code == 200:
+                st.success("✅ Auto-process started! Monitoring below — refreshes automatically.")
+                # Store flag in session state so polling loop activates
+                st.session_state["process_running"] = True
+            else:
+                st.error(f"Error starting process-all: {res.text}")
+        except json.JSONDecodeError:
+            st.error("❌ Base Resume JSON is invalid. Fix it in the Setup tab.")
+        except Exception as e:
+            st.error(f"❌ Could not reach API: {e}")
+
+    # ------------------------------------------------------------------ #
+    # Process-All Status widget                                           #
+    # ------------------------------------------------------------------ #
     proc_status_placeholder = st.empty()
     try:
         pstatus = requests.get(f"{API_URL}/applications/process-all/status", timeout=2).json()
-        if pstatus["running"]:
-            total = pstatus["total"] or 1
-            progress = min(pstatus["processed"] / total, 1.0)
-            label = f"⏳ {pstatus['message']}"
+        msg = pstatus.get("message", "idle")
+        is_running = pstatus.get("running", False)
+        processed = pstatus.get("processed", 0)
+        failed = pstatus.get("failed", 0)
+        total = pstatus.get("total", 0)
+
+        if is_running:
+            # Live progress bar while running
+            denom = total or 1
+            progress = min(processed / denom, 1.0)
+            label = f"⏳ {msg}"
             if pstatus.get("current_job"):
                 label += f" — {pstatus['current_job']}"
             proc_status_placeholder.progress(progress, text=label)
-        elif pstatus["message"] == "idle":
+            # Auto-refresh every 3 s while running
+            time.sleep(3)
+            st.rerun()
+
+        elif msg == "idle":
+            # Fresh start — nothing has run yet
             proc_status_placeholder.caption("")
+
         else:
-            color = "success" if pstatus["failed"] == 0 else "warning"
-            getattr(proc_status_placeholder, color)(f"✅ {pstatus['message']}")
+            # ----------------------------------------------------------------
+            # FIX 2: Correct badge colour logic
+            #   - green  : at least 1 app processed AND no failures
+            #   - warning: processed > 0 but some failures too
+            #   - error  : processed == 0 (all failed or nothing found)
+            # ----------------------------------------------------------------
+            if processed > 0 and failed == 0:
+                proc_status_placeholder.success(f"✅ {msg}")
+            elif processed > 0 and failed > 0:
+                proc_status_placeholder.warning(f"⚠️ {msg}")
+            else:
+                # processed == 0: either all failed or no actionable apps found
+                # Show as info (not green ✅) so it doesn't look like success
+                proc_status_placeholder.info(f"ℹ️ {msg}")
+
     except Exception:
         pass
 
@@ -304,7 +361,9 @@ with tab2:
 
     st.divider()
 
-    # --- Application list ---
+    # ------------------------------------------------------------------ #
+    # Application list                                                    #
+    # ------------------------------------------------------------------ #
     FIT_SCORE_THRESHOLD = 60
     try:
         apps = requests.get(f"{API_URL}/applications").json()
@@ -331,11 +390,18 @@ with tab2:
                 with st.expander(f"App #{app['id']} | {company} - {title} | {location} | Fit: {app['fit_score']}"):
                     st.write(f"**Role Details:** {title} @ {company} ({location})")
 
-                    status_color = "blue"
-                    if app['status'] in ('AUTO_APPLIED', 'APPLIED'): status_color = "green"
-                    elif app['status'] == 'FAILED': status_color = "red"
-                    elif app['status'] == 'TAILORED': status_color = "orange"
-                    st.markdown(f"**Status:** :{status_color}[{app['status']}]")
+                    status = app['status']
+                    if status in ('AUTO_APPLIED', 'APPLIED'):
+                        status_color = "green"
+                    elif status in ('FAILED', 'RESUME_FAILED', 'VALIDATION_FAILED'):
+                        status_color = "red"
+                    elif status == 'TAILORED':
+                        status_color = "orange"
+                    elif status == 'SKIPPED':
+                        status_color = "gray"
+                    else:
+                        status_color = "blue"
+                    st.markdown(f"**Status:** :{status_color}[{status}]")
 
                     full_analysis = app.get('fit_analysis', '')
                     short_analysis = full_analysis.split('\n')[0] if full_analysis else ""
@@ -345,14 +411,20 @@ with tab2:
 
                     colA, colB = st.columns(2)
                     with colA:
-                        if st.button(f"Tailor Resume #{app['id']}"):
-                            res = requests.post(
-                                f"{API_URL}/applications/{app['id']}/tailor",
-                                json=json.loads(base_resume_json)
-                            )
-                            st.success("Tailored!")
+                        if st.button(f"Tailor Resume #{app['id']}", key=f"tailor_{app['id']}"):
+                            try:
+                                res = requests.post(
+                                    f"{API_URL}/applications/{app['id']}/tailor",
+                                    json=json.loads(base_resume_json)
+                                )
+                                if res.status_code == 200:
+                                    st.success("Tailored! Refresh to see updated status.")
+                                else:
+                                    st.error(f"Tailor failed: {res.text}")
+                            except Exception as e:
+                                st.error(f"Error: {e}")
                     with colB:
-                        if st.button(f"Auto-Apply #{app['id']}"):
+                        if st.button(f"Auto-Apply #{app['id']}", key=f"apply_{app['id']}"):
                             profile = {
                                 "first_name": first_name, "last_name": last_name,
                                 "email": email, "phone": phone,
