@@ -1,0 +1,117 @@
+% ============================================================
+% NAUKARI-SAHAAYTA — ATS-SAFE ONE-PAGE RESUME TEMPLATE
+% Based on Jake's Resume style. DO NOT EDIT LAYOUT/GEOMETRY.
+% Only DATA placeholders (<<...>>) are substituted at runtime.
+% ============================================================
+\documentclass[10pt, letterpaper]{article}
+
+% ---------- Packages ----------
+\usepackage[top=0.45in, bottom=0.45in, left=0.5in, right=0.5in]{geometry}
+\usepackage{latexsym}
+\usepackage[empty]{fullpage}
+\usepackage{titlesec}
+\usepackage{marvosym}
+\usepackage[usenames,dvipsnames]{color}
+\usepackage{verbatim}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+\usepackage[english]{babel}
+\usepackage{tabularx}
+\usepackage{fontenc}
+\input{glyphtounicode}
+
+% ---------- ATS Readability ----------
+\pdfgentounicode=1
+
+% ---------- Page style ----------
+\pagestyle{fancy}
+\fancyhf{}
+\fancyfoot{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+
+% ---------- URL style ----------
+\urlstyle{same}
+
+% ---------- Spacing ----------
+\raggedbottom
+\raggedright
+\setlength{\tabcolsep}{0in}
+
+% ---------- Section formatting ----------
+\titleformat{\section}{
+  \vspace{-4pt}\scshape\raggedright\large
+}{}{0em}{}[\color{black}\titlerule \vspace{-5pt}]
+
+% ---------- Custom commands ----------
+\newcommand{\resumeItem}[1]{
+  \item\small{{#1 \vspace{-2pt}}}
+}
+
+\newcommand{\resumeSubheading}[4]{
+  \vspace{-2pt}\item
+    \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+      \textbf{#1} & #2 \\
+      \textit{\small#3} & \textit{\small #4} \\
+    \end{tabular*}\vspace{-7pt}
+}
+
+\newcommand{\resumeProjectHeading}[2]{
+    \item
+    \begin{tabular*}{0.97\textwidth}{l@{\extracolsep{\fill}}r}
+      \small#1 & #2 \\
+    \end{tabular*}\vspace{-7pt}
+}
+
+\newcommand{\resumeSubItem}[1]{\resumeItem{#1}\vspace{-4pt}}
+
+\renewcommand\labelitemii{$\vcenter{\hbox{\tiny$\bullet$}}$}
+
+\newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=0.15in, label={}]}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
+\newcommand{\resumeItemListStart}{\begin{itemize}[leftmargin=0.15in, itemsep=0pt, parsep=0pt, topsep=0pt]}
+\newcommand{\resumeItemListEnd}{\end{itemize}\vspace{-5pt}}
+
+% ============================================================
+\begin{document}
+
+% ---------- HEADER ----------
+\begin{center}
+    {\Huge \scshape <<FULL_NAME>>} \\ \vspace{1pt}
+    \small <<PHONE>> $|$
+    \href{mailto:<<EMAIL>>}{\underline{<<EMAIL>>}} $|$
+    \href{<<LINKEDIN>>}{\underline{LinkedIn}} $|$
+    \href{<<GITHUB>>}{\underline{GitHub}}
+\end{center}
+
+% ---------- SUMMARY ----------
+\section{Summary}
+  <<SUMMARY>>
+\vspace{-4pt}
+
+% ---------- EXPERIENCE ----------
+\section{Experience}
+  \resumeSubHeadingListStart
+<<EXPERIENCE_BLOCKS>>
+  \resumeSubHeadingListEnd
+
+% ---------- PROJECTS ----------
+\section{Projects}
+    \resumeSubHeadingListStart
+<<PROJECT_BLOCKS>>
+    \resumeSubHeadingListEnd
+
+% ---------- EDUCATION ----------
+\section{Education}
+  \resumeSubHeadingListStart
+<<EDUCATION_BLOCKS>>
+  \resumeSubHeadingListEnd
+
+% ---------- TECHNICAL SKILLS ----------
+\section{Technical Skills}
+ \begin{itemize}[leftmargin=0.15in, label={}, itemsep=0pt, parsep=0pt]
+<<SKILLS_ROWS>>
+ \end{itemize}
+
+\end{document}
