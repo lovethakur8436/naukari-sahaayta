@@ -16,19 +16,26 @@ Usage (inside an ingestor or manager):
 """
 
 import re
-from typing import List
+import logging
+from typing import Dict, List, Tuple
+
+logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------ #
 # Tunable constants                                                    #
 # ------------------------------------------------------------------ #
-MAX_JOBS_PER_COMPANY = 10
-MAX_PER_DOMAIN = 2          # at most 2 jobs per domain bucket per company
+MAX_JOBS_PER_COMPANY: int = 10
+MAX_PER_DOMAIN: int = 2       # at most 2 jobs per domain bucket per company
+
+# How many characters of the description to scan for keywords / domain.
+# Kept consistent across _relevance_score and _classify_domain.
+DESC_SCAN_CHARS: int = 500
 
 # ------------------------------------------------------------------ #
 # Candidate skill keywords                                            #
 # Extend this list freely — lowercase, no spaces required.           #
 # ------------------------------------------------------------------ #
-SKILL_KEYWORDS: list[str] = [
+SKILL_KEYWORDS: List[str] = [
     # Languages
     "java", "python", "javascript", "typescript", "go", "golang",
     "kotlin", "scala", "ruby", "rust", "c++", "c#",
@@ -58,7 +65,7 @@ SKILL_KEYWORDS: list[str] = [
 # Maps a job title / description snippet to a broad domain bucket.   #
 # ------------------------------------------------------------------ #
 # Order matters: first match wins.
-_DOMAIN_PATTERNS: list[tuple[str, re.Pattern]] = [
+_DOMAIN_PATTERNS: List[Tuple[str, re.Pattern]] = [
     ("devops",    re.compile(r"devops|sre|platform eng|infra|cloud eng", re.I)),
     ("data",      re.compile(r"data eng|data scientist|ml eng|machine learning|analytics eng|etl", re.I)),
     ("frontend",  re.compile(r"frontend|front-end|ui eng|react|angular|vue", re.I)),
@@ -71,7 +78,7 @@ _DOMAIN_PATTERNS: list[tuple[str, re.Pattern]] = [
 ]
 
 # Location preference: jobs matching these are scored higher
-_PREFERRED_LOCATIONS = re.compile(
+_PREFERRED_LOCATIONS: re.Pattern = re.compile(
     r"india|remote|hyderabad|bangalore|bengaluru|mumbai|chennai|pune|delhi|noida|gurugram",
     re.I
 )
@@ -79,7 +86,7 @@ _PREFERRED_LOCATIONS = re.compile(
 
 def _classify_domain(title: str, description: str = "") -> str:
     """Return a domain bucket for the role, e.g. 'backend', 'devops', 'swe'."""
-    text = f"{title} {description[:500]}"
+    text = "{} {}".format(title, description[:DESC_SCAN_CHARS])
     for domain, pattern in _DOMAIN_PATTERNS:
         if pattern.search(text):
             return domain
@@ -92,7 +99,7 @@ def _relevance_score(title: str, description: str) -> int:
     Title matches count 3x (more specific signal).
     Returns 0 if no match at all.
     """
-    text_lower = (title + " " + description[:1000]).lower()
+    text_lower = ("{} {}".format(title, description[:DESC_SCAN_CHARS])).lower()
     title_lower = title.lower()
     score = 0
     for kw in SKILL_KEYWORDS:
@@ -143,7 +150,7 @@ def filter_and_diversify(
     if not raw_jobs:
         return []
 
-    scored: list[tuple[int, bool, dict]] = []
+    scored: List[Tuple[int, bool, dict]] = []
     for job in raw_jobs:
         title = job.get(title_key, "") or ""
         desc  = job.get(description_key, "") or ""
@@ -159,8 +166,8 @@ def filter_and_diversify(
     # Sort: India/Remote preferred (True > False), then score descending
     scored.sort(key=lambda x: (x[1], x[0]), reverse=True)
 
-    domain_counts: dict[str, int] = {}
-    selected: list[dict] = []
+    domain_counts: Dict[str, int] = {}
+    selected: List[dict] = []
 
     for score, prefers_india, job in scored:
         if len(selected) >= max_jobs:
@@ -178,8 +185,8 @@ def filter_and_diversify(
         selected.append(job)
 
     dropped = len(raw_jobs) - len(selected)
-    print(
-        f"[filter] {company}: {len(raw_jobs)} raw → {len(selected)} kept "
-        f"(dropped {dropped}). Domains: {domain_counts}"
+    logger.info(
+        "[filter] %s: %d raw → %d kept (dropped %d). Domains: %s",
+        company, len(raw_jobs), len(selected), dropped, domain_counts
     )
     return selected

@@ -1,10 +1,15 @@
+import logging
+
 from sqlalchemy.orm import Session
+
 from app.models.job import JobPosting
 from app.ingestors.greenhouse import GreenhouseIngestor
 from app.ingestors.lever import LeverIngestor
 
+logger = logging.getLogger(__name__)
 
-def build_ingestors(greenhouse_tokens: list[str] = None, lever_tokens: list[str] = None):
+
+def build_ingestors(greenhouse_tokens: list = None, lever_tokens: list = None):
     """
     Build ingestor instances from board token lists.
     Pass greenhouse_tokens and/or lever_tokens to specify which companies to ingest.
@@ -25,7 +30,11 @@ def build_ingestors(greenhouse_tokens: list[str] = None, lever_tokens: list[str]
 def ingest_jobs(db: Session, ingestors: list):
     total_added = 0
     for ingestor in ingestors:
-        print(f"Running ingestor: {ingestor.portal_name} / {ingestor.board_token}")
+        # Use getattr so this never raises AttributeError if the base
+        # contract changes or a custom ingestor omits board_token.
+        board_token = getattr(ingestor, "board_token", "<unknown>")
+        logger.info("Running ingestor: %s / %s", ingestor.portal_name, board_token)
+
         normalized_jobs = ingestor.run()
         for job_data in normalized_jobs:
             existing = db.query(JobPosting).filter(
@@ -37,19 +46,24 @@ def ingest_jobs(db: Session, ingestors: list):
                 db.add(db_job)
                 total_added += 1
         db.commit()
-    print(f"Total jobs added: {total_added}")
+
+    logger.info("Total jobs added: %d", total_added)
     return total_added
 
 
 if __name__ == "__main__":
-    from app.database import SessionLocal, Base, engine
-
-    # Auto-create all tables if the DB is fresh (e.g. after deleting the .db file)
-    # This is safe to call even when tables already exist — it's a no-op then.
     import app.models.job          # noqa: F401 — ensure JobPosting model is registered
     import app.models.application  # noqa: F401 — ensure Application model is registered
+    from app.database import SessionLocal, Base, engine
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    # Auto-create all tables if the DB is fresh (safe no-op if already exist)
     Base.metadata.create_all(bind=engine)
-    print("DB tables ensured.")
+    logger.info("DB tables ensured.")
 
     db = SessionLocal()
 

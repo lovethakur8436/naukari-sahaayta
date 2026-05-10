@@ -1,10 +1,15 @@
-import requests
 import html
+import logging
 import re
 from typing import List
+
+import requests
+
 from app.ingestors.base import BaseIngestor
 from app.ingestors.filter import filter_and_diversify
 from app.schemas.job import JobPostingCreate
+
+logger = logging.getLogger(__name__)
 
 
 def _get_company_name(board_token: str) -> str:
@@ -56,12 +61,11 @@ class GreenhouseIngestor(BaseIngestor):
             response.raise_for_status()
             raw_jobs = response.json().get("jobs", [])
 
-            # Flatten location for filter module
+            # Flatten nested location dict into a plain string once, here.
+            # normalize() reads this same key so both paths stay in sync.
             for job in raw_jobs:
-                if isinstance(job.get("location"), dict):
-                    job["_location_str"] = job["location"].get("name", "")
-                else:
-                    job["_location_str"] = str(job.get("location", ""))
+                loc = job.get("location", "")
+                job["_location_str"] = loc.get("name", "") if isinstance(loc, dict) else str(loc)
 
             filtered = filter_and_diversify(
                 raw_jobs,
@@ -71,16 +75,21 @@ class GreenhouseIngestor(BaseIngestor):
                 location_key="_location_str",
             )
             return filtered
-        except Exception as e:
-            print(f"Error fetching Greenhouse jobs for '{self.board_token}': {e}")
+        except Exception:
+            logger.exception("Error fetching Greenhouse jobs for '%s'", self.board_token)
             return []
 
     def normalize(self, raw_job: dict) -> JobPostingCreate:
         description = raw_job.get("content", "")
         clean_desc = re.sub('<[^<]+?>', '', html.unescape(description))
-        location = raw_job.get("location", {})
-        if isinstance(location, dict):
-            location = location.get("name", "")
+
+        # Prefer the pre-flattened string injected by fetch_jobs().
+        # Fall back to re-deriving from the raw location field so that
+        # normalize() remains safe even when called in isolation.
+        location = raw_job.get("_location_str")
+        if not location:
+            loc_raw = raw_job.get("location", "")
+            location = loc_raw.get("name", "") if isinstance(loc_raw, dict) else str(loc_raw)
 
         job_id = raw_job.get("id")
 
