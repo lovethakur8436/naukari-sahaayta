@@ -21,6 +21,12 @@ app = FastAPI(title="Naukari Sahaayta — Job Application Automation API")
 MAX_RETRIES = 5
 RETRY_BASE_DELAY = 30  # seconds; doubles each attempt: 30, 60, 120, 240, 480
 
+# Statuses considered "successfully applied" — hidden from default dashboard view
+_APPLIED_STATUSES = {"AUTO_APPLIED", "APPLIED"}
+
+# Statuses eligible for process-all (unapplied + failed)
+_ACTIONABLE_STATUSES = ["PENDING", "MATCHED", "TAILORED", "FAILED", "VALIDATION_FAILED", "SKIPPED"]
+
 # ------------------------------------------------------------------ #
 # In-memory state                                                      #
 # ------------------------------------------------------------------ #
@@ -133,7 +139,12 @@ def _run_process_all(
     fit_threshold: float,
     delay: int
 ):
-    """Background task: tailor then apply every qualifying unprocessed application."""
+    """
+    Background task: tailor then apply every qualifying actionable application.
+    Actionable = status in _ACTIONABLE_STATUSES (includes FAILED/SKIPPED for retries)
+    and fit_score >= fit_threshold.
+    Successfully applied (AUTO_APPLIED / APPLIED) are never touched.
+    """
     global process_status
     db = SessionLocal()
     try:
@@ -142,13 +153,13 @@ def _run_process_all(
             "current_job": "", "message": "starting"
         })
 
-        # Fetch all qualifying apps not yet applied
+        # Fetch all qualifying apps that are unapplied OR failed (for retry)
         apps = (
             db.query(Application)
             .join(JobPosting, Application.job_id == JobPosting.id)
             .filter(
                 Application.fit_score >= fit_threshold,
-                Application.status.notin_(["AUTO_APPLIED", "APPLIED", "FAILED"])
+                Application.status.in_(_ACTIONABLE_STATUSES)
             )
             .order_by(Application.fit_score.desc())
             .all()
@@ -162,7 +173,7 @@ def _run_process_all(
             job_label = f"{job.title} @ {job.company}" if job else f"App #{app_entry.id}"
 
             # --- Step 1: Tailor (skip if already tailored) ---
-            if app_entry.status != "TAILORED":
+            if app_entry.status not in ("TAILORED", "FAILED", "VALIDATION_FAILED", "SKIPPED"):
                 try:
                     process_status["current_job"] = f"Tailoring: {job_label}"
                     process_status["message"] = process_status["current_job"]
@@ -193,7 +204,6 @@ def _run_process_all(
                 process_status["current_job"] = f"Applying: {job_label}"
                 process_status["message"] = process_status["current_job"]
                 print(f"[process-all] Applying {job_label}")
-                # process_application is synchronous Playwright — run inline
                 process_application(db, app_entry, candidate_profile)
                 process_status["processed"] += 1
             except Exception as e:
@@ -358,11 +368,33 @@ def read_applications(
     status: Optional[str] = Query(None),
     min_score: Optional[float] = Query(None),
     company: Optional[str] = Query(None),
+    include_applied: bool = Query(
+        False,
+        description="Set to true to also show successfully applied jobs (AUTO_APPLIED / APPLIED). "
+                    "Default is false — the dashboard hides completed applications."
+    ),
     db: Session = Depends(get_db)
 ):
+    """
+    List applications.
+
+    Default behaviour (include_applied=false):
+      Returns only actionable applications — those that still need attention:
+      PENDING, MATCHED, TAILORED, FAILED, VALIDATION_FAILED, SKIPPED.
+      Successfully applied jobs (AUTO_APPLIED / APPLIED) are hidden to keep
+      the dashboard clean.
+
+    Pass ?include_applied=true to see the full history including applied jobs.
+    """
     q = db.query(Application)
+
     if status:
+        # Explicit status filter overrides include_applied
         q = q.filter(Application.status == status.upper())
+    elif not include_applied:
+        # Default: hide successfully applied
+        q = q.filter(Application.status.notin_(list(_APPLIED_STATUSES)))
+
     if min_score is not None:
         q = q.filter(Application.fit_score >= min_score)
     if company:
