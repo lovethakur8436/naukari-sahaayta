@@ -5,7 +5,7 @@ Skill-based relevance filtering and domain-level deduplication for
 fetched job postings.
 
 Goal: Quality over quantity.
-  - Keep only jobs relevant to the candidate's skill set.
+  - Keep only jobs relevant to the candidate’s skill set.
   - Deduplicate by role domain (at most MAX_PER_DOMAIN jobs per domain per company).
   - Return at most MAX_JOBS_PER_COMPANY jobs per company.
   - Prefer India / Remote locations when available.
@@ -15,30 +15,29 @@ Usage (inside an ingestor or manager):
     kept = filter_and_diversify(raw_jobs, company="GitLab")
 """
 
-import re
+import html as _html
 import logging
-from typing import Dict, List, Tuple
+import re
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+__all__ = ["filter_and_diversify", "SKILL_KEYWORDS", "MAX_JOBS_PER_COMPANY", "MAX_PER_DOMAIN"]
 
 # ------------------------------------------------------------------ #
 # Tunable constants                                                    #
 # ------------------------------------------------------------------ #
 MAX_JOBS_PER_COMPANY: int = 10
-MAX_PER_DOMAIN: int = 2       # at most 2 jobs per domain bucket per company
-
-# How many characters of the description to scan for keywords / domain.
-# Kept consistent across _relevance_score and _classify_domain.
-DESC_SCAN_CHARS: int = 500
+MAX_PER_DOMAIN: int = 2
+DESC_SCAN_CHARS: int = 600
 
 # ------------------------------------------------------------------ #
-# Candidate skill keywords                                            #
-# Extend this list freely — lowercase, no spaces required.           #
+# Candidate skill keywords (lowercase)                                #
 # ------------------------------------------------------------------ #
 SKILL_KEYWORDS: List[str] = [
     # Languages
     "java", "python", "javascript", "typescript", "go", "golang",
-    "kotlin", "scala", "ruby", "rust", "c++", "c#",
+    "kotlin", "scala", "ruby", "rust",
     # Frameworks / libs
     "spring", "spring boot", "springboot", "django", "fastapi", "flask",
     "react", "angular", "vue", "next.js", "nextjs", "node", "nodejs",
@@ -61,31 +60,39 @@ SKILL_KEYWORDS: List[str] = [
 ]
 
 # ------------------------------------------------------------------ #
-# Domain classifier                                                   #
-# Maps a job title / description snippet to a broad domain bucket.   #
+# Domain classifier (first match wins)                                #
 # ------------------------------------------------------------------ #
-# Order matters: first match wins.
 _DOMAIN_PATTERNS: List[Tuple[str, re.Pattern]] = [
-    ("devops",    re.compile(r"devops|sre|platform eng|infra|cloud eng", re.I)),
-    ("data",      re.compile(r"data eng|data scientist|ml eng|machine learning|analytics eng|etl", re.I)),
-    ("frontend",  re.compile(r"frontend|front-end|ui eng|react|angular|vue", re.I)),
-    ("qa",        re.compile(r"qa eng|quality assurance|test eng|sdet|automation test", re.I)),
+    ("devops",    re.compile(r"devops|\bsre\b|platform eng|infra eng|cloud eng", re.I)),
+    ("data",      re.compile(r"data eng|data scientist|\bml eng|machine learning|analytics eng|\betl\b", re.I)),
+    ("frontend",  re.compile(r"frontend|front-end|\bui eng|\breact\b|\bangular\b|\bvue\b", re.I)),
+    ("qa",        re.compile(r"qa eng|quality assurance|test eng|\bsdet\b|automation test", re.I)),
     ("backend",   re.compile(r"backend|back-end|api eng|server.side", re.I)),
     ("fullstack", re.compile(r"full.?stack", re.I)),
-    ("mobile",    re.compile(r"android|ios|mobile eng|react native|flutter", re.I)),
+    ("mobile",    re.compile(r"android|\bios\b|mobile eng|react native|flutter", re.I)),
     ("security",  re.compile(r"security eng|appsec|devsecops|pen test", re.I)),
-    ("swe",       re.compile(r"software eng|software dev|sde|swe", re.I)),  # catch-all SWE
+    ("swe",       re.compile(r"software eng|software dev|\bsde\b|\bswe\b", re.I)),
 ]
 
-# Location preference: jobs matching these are scored higher
 _PREFERRED_LOCATIONS: re.Pattern = re.compile(
-    r"india|remote|hyderabad|bangalore|bengaluru|mumbai|chennai|pune|delhi|noida|gurugram",
-    re.I
+    r"india|remote|worldwide|global|hyderabad|bangalore|bengaluru|mumbai"
+    r"|chennai|pune|delhi|noida|gurugram|gurgaon",
+    re.I,
 )
+
+# Simple HTML tag stripper used before scoring HTML descriptions
+_HTML_TAG_RE: re.Pattern = re.compile(r"<[^>]+>")
+
+
+def _strip_html(text: str) -> str:
+    """Strip HTML tags and unescape entities. Safe to call on plain text."""
+    if "<" in text:
+        text = _HTML_TAG_RE.sub(" ", _html.unescape(text))
+    return text
 
 
 def _classify_domain(title: str, description: str = "") -> str:
-    """Return a domain bucket for the role, e.g. 'backend', 'devops', 'swe'."""
+    """Return a broad domain bucket for the role."""
     text = "{} {}".format(title, description[:DESC_SCAN_CHARS])
     for domain, pattern in _DOMAIN_PATTERNS:
         if pattern.search(text):
@@ -95,27 +102,32 @@ def _classify_domain(title: str, description: str = "") -> str:
 
 def _relevance_score(title: str, description: str) -> int:
     """
-    Count how many skill keywords appear in the title + description.
-    Title matches count 3x (more specific signal).
-    Returns 0 if no match at all.
+    Count skill keyword hits across title + description.
+
+    Fix: previously, keywords found in title_lower were *also* found in
+    text_lower (since text_lower = title + desc), causing double-counting.
+    Now: title hits get +3, desc-only hits get +1 (mutually exclusive).
     """
-    text_lower = ("{} {}".format(title, description[:DESC_SCAN_CHARS])).lower()
     title_lower = title.lower()
+    # Only the description portion, not the full combined text
+    desc_lower = description[:DESC_SCAN_CHARS].lower()
+
     score = 0
     for kw in SKILL_KEYWORDS:
         if kw in title_lower:
-            score += 3
-        elif kw in text_lower:
+            score += 3          # title match only
+        elif kw in desc_lower:  # elif — avoids double-counting
             score += 1
     return score
 
 
 def _prefers_india(location: str) -> bool:
+    """True if the location string matches an India/Remote preference."""
     return bool(_PREFERRED_LOCATIONS.search(location or ""))
 
 
 def filter_and_diversify(
-    raw_jobs: List[dict],
+    raw_jobs: List[Optional[dict]],
     company: str = "",
     title_key: str = "title",
     description_key: str = "description",
@@ -128,65 +140,61 @@ def filter_and_diversify(
     Filter and diversify a list of raw job dicts from a single company.
 
     Steps:
-      1. Score every job for skill relevance.
-      2. Drop jobs with score < min_score (not relevant to candidate).
-      3. Sort by: India/Remote first, then score descending.
-      4. Walk sorted list; pick a job only if its domain bucket is not full yet.
-      5. Stop once max_jobs is reached.
-
-    Args:
-        raw_jobs:         raw job list from ingestor.fetch_jobs()
-        company:          company name (for logging only)
-        title_key:        dict key for job title
-        description_key:  dict key for job description
-        location_key:     dict key for location string
-        max_jobs:         cap per company (default MAX_JOBS_PER_COMPANY = 10)
-        max_per_domain:   max picks per domain bucket (default MAX_PER_DOMAIN = 2)
-        min_score:        minimum skill keyword hits to pass relevance gate (default 1)
-
-    Returns:
-        Filtered & diversified list of raw job dicts (at most max_jobs).
+      1. Strip HTML from descriptions before scoring.
+      2. Score every job for skill relevance (title 3x, desc 1x, no double-count).
+      3. Drop jobs with score < min_score.
+      4. Sort: India/Remote first, then score descending (fixed sort key).
+      5. Walk sorted list; pick a job only if its domain bucket is not full.
+      6. Stop once max_jobs is reached.
     """
     if not raw_jobs:
         return []
 
     scored: List[Tuple[int, bool, dict]] = []
     for job in raw_jobs:
-        title = job.get(title_key, "") or ""
-        desc  = job.get(description_key, "") or ""
-        loc   = job.get(location_key, "") or ""
+        if not isinstance(job, dict):   # guard against None / malformed entries
+            continue
+
+        title = job.get(title_key) or ""
+        raw_desc = job.get(description_key) or ""
+        desc = _strip_html(raw_desc)     # strip HTML before keyword matching
+        loc = job.get(location_key) or ""
 
         score = _relevance_score(title, desc)
         if score < min_score:
-            continue  # not relevant
+            continue
 
         prefers = _prefers_india(loc)
         scored.append((score, prefers, job))
 
-    # Sort: India/Remote preferred (True > False), then score descending
-    scored.sort(key=lambda x: (x[1], x[0]), reverse=True)
+    # Fix: previously used sort(..., reverse=True) on a (score, prefers_india) tuple.
+    # Both fields flip direction together, which is wrong when prefers_india=False
+    # jobs with high scores beat prefers_india=True jobs with lower scores.
+    # Fix: use a key that sorts prefers_india descending and score descending independently.
+    scored.sort(key=lambda x: (not x[1], -x[0]))  # False>True inverted; score negated
 
     domain_counts: Dict[str, int] = {}
     selected: List[dict] = []
 
-    for score, prefers_india, job in scored:
+    for score, prefers_india_flag, job in scored:
         if len(selected) >= max_jobs:
             break
 
-        title = job.get(title_key, "") or ""
-        desc  = job.get(description_key, "") or ""
+        title = job.get(title_key) or ""
+        raw_desc = job.get(description_key) or ""
+        desc = _strip_html(raw_desc)
         domain = _classify_domain(title, desc)
 
         current = domain_counts.get(domain, 0)
         if current >= max_per_domain:
-            continue  # domain already full
+            continue
 
         domain_counts[domain] = current + 1
         selected.append(job)
 
     dropped = len(raw_jobs) - len(selected)
     logger.info(
-        "[filter] %s: %d raw → %d kept (dropped %d). Domains: %s",
-        company, len(raw_jobs), len(selected), dropped, domain_counts
+        "[filter] %s: %d raw -> %d kept (dropped %d). Domains: %s",
+        company or "(unknown)", len(raw_jobs), len(selected), dropped, domain_counts,
     )
     return selected
