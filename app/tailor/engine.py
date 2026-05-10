@@ -24,6 +24,7 @@ Resume Quality Standards enforced:
 import os
 import re
 import json
+import time
 import subprocess
 import textwrap
 from groq import Groq
@@ -36,6 +37,26 @@ load_dotenv()
 MAX_RETRIES = 3
 MIN_QUALITY_SCORE = 70
 MIN_METRIC_BULLETS = 3  # hard gate: at least this many bullets must contain a number/%
+
+# ─────────────────────────────────────────────────────────────
+# Groq client + model fallback chain
+# ─────────────────────────────────────────────────────────────
+# Primary model: llama-3.3-70b-versatile (100k TPD on free tier)
+# Fallback 1:    llama-3.1-8b-instant     (separate quota — smaller but fast)
+# Fallback 2:    gemma2-9b-it             (Google model on Groq, separate quota)
+#
+# On 429 (rate_limit_exceeded):
+#   - If "tokens per day" in error message → exhausted daily quota for this model
+#     → immediately switch to next fallback model (no point waiting)
+#   - If "tokens per minute" or "requests per minute" in error message → transient
+#     → wait extracted seconds then retry same model (max 2 waits before switching)
+
+_GROQ_MODEL_CHAIN = [
+    "llama-3.3-70b-versatile",   # best quality — use first
+    "llama-3.1-8b-instant",      # separate TPD quota — fallback on daily limit
+    "gemma2-9b-it",              # Google model on Groq — last resort
+]
+
 _groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # ─────────────────────────────────────────────────────────────
@@ -82,12 +103,9 @@ def _esc(text: str) -> str:
     """
     if not text:
         return ""
-    # If the string already has LaTeX escape sequences, pass it through unchanged
     if _ALREADY_LATEX_RE.search(text):
         return text
-    # Otherwise escape all special characters
     result = text
-    # Escape backslash first before other replacements
     result = result.replace('\\', r'\textbackslash{}')
     for char, replacement in _LATEX_ESCAPE:
         if char == '\\':
@@ -97,32 +115,93 @@ def _esc(text: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# LLM helpers
+# LLM helpers — with smart 429 handling
 # ─────────────────────────────────────────────────────────────
 
-def _groq_text(prompt: str, system: str = "") -> str:
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-    resp = _groq_client.chat.completions.create(
-        messages=messages,
-        model="llama-3.3-70b-versatile",
+def _parse_retry_wait(error_message: str) -> float:
+    """
+    Extract the suggested wait time in seconds from a Groq 429 error message.
+    Example message: '...Please try again in 18m26.784s...'
+    Returns 0 if not parseable (caller decides what to do).
+    """
+    m = re.search(r'try again in\s+(?:(\d+)m)?(\d+(?:\.\d+)?)s', str(error_message), re.I)
+    if m:
+        minutes = int(m.group(1) or 0)
+        seconds = float(m.group(2) or 0)
+        return minutes * 60 + seconds
+    return 0.0
+
+
+def _is_daily_limit(error_message: str) -> bool:
+    """Return True if this 429 is a daily token exhaustion (not a per-minute burst)."""
+    return "tokens per day" in str(error_message).lower() or "tpd" in str(error_message).lower()
+
+
+def _groq_call(prompt: str, system: str = "", json_mode: bool = False) -> str | dict:
+    """
+    Call Groq with automatic model fallback on 429 daily-limit errors,
+    and smart wait-then-retry on per-minute rate limits.
+
+    Model chain: llama-3.3-70b-versatile → llama-3.1-8b-instant → gemma2-9b-it
+    """
+    last_error = None
+
+    for model in _GROQ_MODEL_CHAIN:
+        minute_waits = 0  # allow up to 1 per-minute wait per model before switching
+
+        for _try in range(2):  # up to 2 attempts per model (1 normal + 1 after wait)
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+
+            kwargs = dict(messages=messages, model=model)
+            if json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+
+            try:
+                resp = _groq_client.chat.completions.create(**kwargs)
+                raw = resp.choices[0].message.content
+                if json_mode:
+                    return json.loads(raw)
+                return raw
+
+            except Exception as e:
+                err_str = str(e)
+                last_error = e
+
+                if "429" not in err_str and "rate_limit" not in err_str.lower():
+                    # Non-rate-limit error — propagate immediately
+                    raise
+
+                if _is_daily_limit(err_str):
+                    # Daily quota exhausted for this model → try next model
+                    print(f"  [groq] Daily TPD limit hit on {model} — switching to next model")
+                    break  # break inner loop, advance to next model in chain
+
+                # Per-minute / per-request burst limit — wait and retry once
+                wait_secs = _parse_retry_wait(err_str)
+                if wait_secs > 0 and minute_waits == 0:
+                    print(f"  [groq] Per-minute limit on {model} — waiting {wait_secs:.0f}s then retrying")
+                    time.sleep(wait_secs + 2)  # +2s buffer
+                    minute_waits += 1
+                    continue  # retry same model after wait
+                else:
+                    # Already waited once, or can't parse wait time → try next model
+                    print(f"  [groq] Rate limit on {model} (no wait available) — switching model")
+                    break
+
+    raise RuntimeError(
+        f"All Groq models exhausted. Last error: {last_error}"
     )
-    return resp.choices[0].message.content
+
+
+def _groq_text(prompt: str, system: str = "") -> str:
+    return _groq_call(prompt, system=system, json_mode=False)
 
 
 def _groq_json(prompt: str, system: str = "") -> dict:
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-    resp = _groq_client.chat.completions.create(
-        messages=messages,
-        model="llama-3.3-70b-versatile",
-        response_format={"type": "json_object"},
-    )
-    return json.loads(resp.choices[0].message.content)
+    return _groq_call(prompt, system=system, json_mode=True)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -151,13 +230,7 @@ def _fill_resume_json(base_resume_data: dict, job_title: str, job_desc: str, att
 
     NOTE: Education is NOT sent to the LLM for generation — it is hardcoded
     in _EDUCATION_GROUND_TRUTH and injected directly by the renderer.
-    The LLM JSON schema still includes an education placeholder so the
-    validator doesn't fail, but the renderer always overrides it.
     """
-    # FIX 2: tighter bullet limits to prevent 2-page overflow.
-    # Attempt 1: 4 primary bullets, 2 project bullets per project
-    # Attempt 2: 3 primary bullets, 2 project bullets per project
-    # Attempt 3: 3 primary bullets, 1 project bullet per project
     bullet_limits = {
         1: {"primary": 4, "intern": 2, "project": 2},
         2: {"primary": 3, "intern": 1, "project": 2},
@@ -300,20 +373,11 @@ def _validate_resume_json(data: dict) -> None:
     Raise ValueError if the LLM JSON is missing required sections or
     has obviously empty/placeholder content. This triggers a retry
     before wasting a pdflatex compile.
-
-    Also enforces:
-    - No LaTeX markup in bullet text (backslash check)
-    - Minimum MIM_METRIC_BULLETS bullets must contain a number/percentage
-
-    NOTE: Education validation is intentionally lenient here — the renderer
-    always uses _EDUCATION_GROUND_TRUTH regardless of what the LLM returns.
     """
-    # Summary
     summary = data.get("summary", "").strip()
     if len(summary) < 40:
         raise ValueError(f"Summary too short or missing: '{summary[:60]}'")
 
-    # Experience
     experience = data.get("experience", [])
     if not experience:
         raise ValueError("experience array is empty")
@@ -334,7 +398,6 @@ def _validate_resume_json(data: dict) -> None:
                 )
             all_bullets.append(b)
 
-    # Projects
     projects = data.get("projects", [])
     if not projects:
         raise ValueError("projects array is empty")
@@ -349,17 +412,13 @@ def _validate_resume_json(data: dict) -> None:
                 )
             all_bullets.append(b)
 
-    # Education — only check the key exists; content is always overridden
-    # by _EDUCATION_GROUND_TRUTH in the renderer so we don't validate values.
     if "education" not in data:
         raise ValueError("education key missing from LLM response")
 
-    # Skills
     skills = data.get("skills", [])
     if len(skills) < 3:
         raise ValueError(f"Only {len(skills)} skill categories — need at least 3")
 
-    # Hard gate: minimum metric-containing bullets
     metric_count = sum(1 for b in all_bullets if _METRIC_RE.search(b))
     if metric_count < MIN_METRIC_BULLETS:
         raise ValueError(
@@ -377,12 +436,9 @@ def _render_tex_from_json(data: dict, base: dict) -> str:
     Inject structured JSON data into the LaTeX template.
     LLM never touches layout — only content strings are substituted.
 
-    FIX 1 (education): Always uses _EDUCATION_GROUND_TRUTH — the LLM's
-    education array is completely ignored. This prevents any hallucination
-    of the university name, degree, location, or dates.
-
-    FIX 2 (page overflow): Each experience/project block's bullet list is
-    explicitly wrapped inside \\resumeItemListStart ... \\resumeItemListEnd.
+    FIX (education): Always uses _EDUCATION_GROUND_TRUTH — LLM data is ignored.
+    FIX (project heading): Uses a real newline between heading and itemlist,
+        not the literal '\\n' string that caused pdflatex to fail.
     """
     with open('app/tailor/template.tex', 'r') as f:
         tpl = f.read()
@@ -416,6 +472,10 @@ def _render_tex_from_json(data: dict, base: dict) -> str:
     tpl = tpl.replace('<<EXPERIENCE_BLOCKS>>', '\n'.join(exp_blocks))
 
     # Projects
+    # FIX: heading_line must end with a real newline character (\n),
+    # NOT the two-character literal backslash-n that appeared in the old code.
+    # The old bug: '...}{}\\n' → LaTeX saw the literal text \n which is not
+    # a valid LaTeX command, causing pdflatex to fail on every compile.
     proj_blocks = []
     for proj in data.get('projects', []):
         bullets_tex = '\n'.join(
@@ -424,20 +484,17 @@ def _render_tex_from_json(data: dict, base: dict) -> str:
         )
         name_esc = _esc(proj["name"])
         tech_esc = _esc(proj["tech"])
-        heading_line = (
-            '    \\resumeProjectHeading\n'
-            '      {\\textbf{' + name_esc + '} $|$ \\emph{\\small{' + tech_esc + '}}}{}\\n'
-        )
         block = (
-            heading_line
-            + '      \\resumeItemListStart\n'
-            + bullets_tex + '\n'
-            + '      \\resumeItemListEnd'
+            f'    \\resumeProjectHeading\n'
+            f'      {{\\textbf{{{name_esc}}} $|$ \\emph{{\\small{{{tech_esc}}}}}}}{{}}\n'
+            f'      \\resumeItemListStart\n'
+            f'{bullets_tex}\n'
+            f'      \\resumeItemListEnd'
         )
         proj_blocks.append(block)
     tpl = tpl.replace('<<PROJECT_BLOCKS>>', '\n'.join(proj_blocks))
 
-    # FIX 1: Education — always use ground-truth data, never the LLM's output.
+    # Education — always use ground-truth, never the LLM's output.
     edu_blocks = []
     for edu in _EDUCATION_GROUND_TRUTH:
         block = (
@@ -643,7 +700,8 @@ def generate_tailored_resume(db: Session, application: Application, base_resume_
         # ── Step 3: Compile ────────────────────────────────────────
         compiled, log = _compile_pdf(tex_path)
         if not compiled:
-            print(f"  [tailor] pdflatex failed on attempt {attempt}")
+            # Dump first 2000 chars of log to help diagnose LaTeX errors
+            print(f"  [tailor] pdflatex failed on attempt {attempt}. Log excerpt:\n{log[:2000]}")
             last_issues = ["pdflatex compilation failed"]
             continue
 
